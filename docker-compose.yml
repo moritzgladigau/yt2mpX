@@ -1,0 +1,13 @@
+services:
+  yt2mpx:
+    build: .
+    container_name: yt2mpx
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      YTMPX_DATA_DIR: /data
+      YTMPX_JOB_TTL_HOURS: 2
+      YTMPX_MAX_PLAYLIST_ITEMS: 100
+    volumes:
+      - ./downloads:/data

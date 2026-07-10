@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>yt2mpX</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <div class="brand">
+          <span class="mark">yX</span>
+          <div>
+            <h1>yt2mpX</h1>
+            <p>Lokaler Downloader fuer dein Heimnetz.</p>
+          </div>
+        </div>
+
+        <form id="probe-form" class="url-row">
+          <input id="url" name="url" type="url" placeholder="YouTube Link oder Playlist einfuegen" required />
+          <button id="probe-button" type="submit">Pruefen</button>
+        </form>
+
+        <p id="notice" class="notice" role="status"></p>
+
+        <section id="result" class="result hidden">
+          <div class="media-head">
+            <img id="thumbnail" alt="" />
+            <div>
+              <span id="media-type" class="pill"></span>
+              <h2 id="media-title"></h2>
+              <p id="media-count"></p>
+            </div>
+          </div>
+
+          <div class="format-quality-row">
+            <div class="format-row" role="radiogroup" aria-label="Format">
+              <label><input type="radio" name="format" value="mp3" checked /> MP3</label>
+              <label><input type="radio" name="format" value="mp4" /> MP4</label>
+            </div>
+            <label class="quality-control">
+              Qualitaet
+              <select id="quality-select"></select>
+            </label>
+          </div>
+
+          <div class="fields">
+            <label>Titel <input id="meta-title" type="text" /></label>
+            <label>Artist <input id="meta-artist" type="text" /></label>
+            <label>Album <input id="meta-album" type="text" /></label>
+            <label>Cover URL <input id="meta-cover" type="url" /></label>
+          </div>
+
+          <details id="playlist-details" class="playlist hidden">
+            <summary>Playlist-Auswahl</summary>
+            <div class="playlist-controls">
+              <label class="playlist-rule">
+                Bereich
+                <input id="playlist-rule" type="text" placeholder="1-20, 1-20,45,60 oder 4,8,12" />
+              </label>
+              <span id="playlist-summary" class="selection-summary">0 von 0 Tracks ausgewaehlt</span>
+            </div>
+            <div id="manual-actions" class="manual-actions hidden">
+              <button id="select-all" type="button">Alle auswaehlen</button>
+              <button id="select-none" type="button">Keine</button>
+              <button id="select-invert" type="button">Auswahl umkehren</button>
+            </div>
+            <ol id="entries"></ol>
+          </details>
+
+          <button id="start-button" class="primary" type="button">Download starten</button>
+        </section>
+
+        <section id="job" class="job hidden">
+          <div class="job-top">
+            <strong id="job-message">Wartet</strong>
+            <span id="job-percent">0%</span>
+          </div>
+          <progress id="job-progress" max="100" value="0"></progress>
+          <a id="download-link" class="download hidden">Datei herunterladen</a>
+          <p id="download-size" class="download-size hidden"></p>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
