@@ -26,9 +26,10 @@ STATIC_DIR = ROOT_DIR / "static"
 DATA_DIR = Path(os.getenv("YTMPX_DATA_DIR", "/data")).resolve()
 JOBS_DIR = DATA_DIR / "jobs"
 MAX_PLAYLIST_ITEMS = int(os.getenv("YTMPX_MAX_PLAYLIST_ITEMS", "100"))
-JOB_TTL_HOURS = int(os.getenv("YTMPX_JOB_TTL_HOURS", "2"))
+JOB_TTL_MINUTES = int(os.getenv("YTMPX_JOB_TTL_MINUTES", str(int(os.getenv("YTMPX_JOB_TTL_HOURS", "2")) * 60)))
 PROBE_TIMEOUT_SECONDS = int(os.getenv("YTMPX_PROBE_TIMEOUT_SECONDS", "75"))
 YTDLP_SOCKET_TIMEOUT_SECONDS = int(os.getenv("YTMPX_YTDLP_SOCKET_TIMEOUT_SECONDS", "30"))
+MAX_DOWNLOAD_STEM_LENGTH = 180
 
 
 class ProbeRequest(BaseModel):
@@ -48,7 +49,7 @@ class JobRequest(BaseModel):
     metadata: Metadata = Field(default_factory=Metadata)
     session_id: str = Field(default="")
     playlist_items: list[int] = Field(default_factory=list)
-    audio_quality: Literal["high", "medium", "small"] = "high"
+    audio_quality: Literal["high", "medium", "small", "minimal"] = "medium"
     video_quality: Literal["360", "720", "1080", "best_compatible"] = "best_compatible"
 
 
@@ -60,7 +61,7 @@ class Job:
     metadata: Metadata
     session_id: str
     playlist_items: list[int] = field(default_factory=list)
-    audio_quality: str = "high"
+    audio_quality: str = "medium"
     video_quality: str = "best_compatible"
     status: str = "queued"
     progress: float = 0
@@ -154,6 +155,7 @@ def mp3_quality_value(quality: str) -> str:
         "high": "0",
         "medium": "192",
         "small": "128",
+        "minimal": "32",
     }.get(quality, "0")
 
 
@@ -174,6 +176,8 @@ def mp4_format_selector(quality: str) -> str:
 
 def ydl_options(job: Job, work_dir: Path) -> dict[str, Any]:
     is_playlist_selection = bool(job.playlist_items)
+    is_minimal_audio = job.media_format == "mp3" and job.audio_quality == "minimal"
+    should_embed_cover = not is_minimal_audio
     if is_playlist_selection:
         outtmpl = str(work_dir / "%(title).170B __yt2mpx_%(playlist_index)05d.%(ext)s")
     else:
@@ -190,6 +194,7 @@ def ydl_options(job: Job, work_dir: Path) -> dict[str, Any]:
     }
     if is_playlist_selection:
         common["playlist_items"] = ",".join(str(item) for item in sorted(set(job.playlist_items)))
+    if is_playlist_selection and should_embed_cover:
         common["writethumbnail"] = True
     if job.media_format == "mp3":
         postprocessors: list[dict[str, Any]] = [
@@ -200,15 +205,12 @@ def ydl_options(job: Job, work_dir: Path) -> dict[str, Any]:
             }
         ]
         if is_playlist_selection:
-            postprocessors.extend(
-                [
-                    {"key": "FFmpegMetadata"},
-                    {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-                ]
-            )
+            postprocessors.append({"key": "FFmpegMetadata"})
+            if should_embed_cover:
+                postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
         common.update(
             {
-                "format": "bestaudio/best",
+                "format": "worstaudio/worst" if is_minimal_audio else "bestaudio/best",
                 "postprocessors": postprocessors,
             }
         )
@@ -265,12 +267,12 @@ def apply_mp3_metadata(path: Path, metadata: Metadata, cover_path: Path | None) 
         easy["album"] = metadata.album
     easy.save()
 
+    tags = ID3(path)
+    tags.delall("APIC")
     if cover_path:
-        tags = ID3(path)
         mime = "image/png" if cover_path.suffix.lower() == ".png" else "image/jpeg"
-        tags.delall("APIC")
         tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cover_path.read_bytes()))
-        tags.save(v2_version=3)
+    tags.save(v2_version=3)
 
 
 def apply_mp4_metadata(path: Path, metadata: Metadata, cover_path: Path | None) -> None:
@@ -281,6 +283,7 @@ def apply_mp4_metadata(path: Path, metadata: Metadata, cover_path: Path | None) 
         video["\xa9ART"] = [metadata.artist]
     if metadata.album:
         video["\xa9alb"] = [metadata.album]
+    video.pop("covr", None)
     if cover_path:
         image_format = MP4Cover.FORMAT_PNG if cover_path.suffix.lower() == ".png" else MP4Cover.FORMAT_JPEG
         video["covr"] = [MP4Cover(cover_path.read_bytes(), imageformat=image_format)]
@@ -322,12 +325,35 @@ def build_zip(files: list[Path], target: Path) -> None:
             archive.write(file_path, arcname=file_path.name)
 
 
+def safe_filename_stem(value: str, fallback: str = "yt2mpX-download") -> str:
+    safe = "".join(char if char.isalnum() or char in " ._-" else "_" for char in value).strip(" ._-")
+    safe = safe[:MAX_DOWNLOAD_STEM_LENGTH].rstrip(" ._-")
+    return safe or fallback
+
+
+def metadata_download_stem(metadata: Metadata) -> str:
+    title = metadata.title.strip()
+    artist = metadata.artist.strip()
+    if title and artist:
+        return f"{title} - {artist}"
+    return title or artist or "yt2mpX-download"
+
+
 def safe_download_name(job: Job, files: list[Path]) -> str:
-    if len(files) == 1 and not job.playlist_items:
-        return files[0].name
-    base = job.metadata.album or job.metadata.title or "yt2mpX-download"
+    base = job.metadata.album.strip() if len(files) != 1 or job.playlist_items else ""
+    if not base:
+        base = metadata_download_stem(job.metadata)
     safe = "".join(char if char.isalnum() or char in " ._-" else "_" for char in base).strip()
-    return f"{safe or 'yt2mpX-download'}.zip"
+    suffix = files[0].suffix if len(files) == 1 and not job.playlist_items else ".zip"
+    return f"{safe_filename_stem(safe)}{suffix}"
+
+
+def rename_output_file(path: Path, download_name: str) -> Path:
+    target = path.with_name(download_name)
+    if target == path:
+        return path
+    path.rename(target)
+    return target
 
 
 def unpacked_zip_size(path: Path) -> int | None:
@@ -358,21 +384,26 @@ def run_job(job: Job) -> None:
             files = deduplicate_playlist_filenames(files)
 
         touch(job, progress=90, message="Schreibe Metadaten")
-        cover_path = download_cover(job.metadata.cover_url, work_dir) if len(files) == 1 and not job.playlist_items else None
+        should_embed_cover = not (job.media_format == "mp3" and job.audio_quality == "minimal")
+        cover_path = (
+            download_cover(job.metadata.cover_url, work_dir)
+            if should_embed_cover and len(files) == 1 and not job.playlist_items
+            else None
+        )
         if len(files) == 1 and not job.playlist_items:
             if job.media_format == "mp3":
                 apply_mp3_metadata(files[0], job.metadata, cover_path)
             else:
                 apply_mp4_metadata(files[0], job.metadata, cover_path)
 
+        job.download_name = safe_download_name(job, files)
         if len(files) == 1 and not job.playlist_items:
-            job.output_path = files[0]
+            job.output_path = rename_output_file(files[0], job.download_name)
         else:
-            zip_path = job_dir / safe_download_name(job, files)
+            zip_path = job_dir / job.download_name
             build_zip(files, zip_path)
             job.output_path = zip_path
 
-        job.download_name = safe_download_name(job, files)
         touch(job, status="done", progress=100, message="Fertig")
     except Exception as exc:
         job.error = str(exc)
@@ -381,8 +412,8 @@ def run_job(job: Job) -> None:
 
 async def cleanup_loop() -> None:
     while True:
-        await asyncio.sleep(15 * 60)
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=JOB_TTL_HOURS)
+        await asyncio.sleep(5 * 60)
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=JOB_TTL_MINUTES)
         for job_id, job in list(jobs.items()):
             if job.updated_at < cutoff and job.status in {"done", "failed"}:
                 shutil.rmtree(JOBS_DIR / job_id, ignore_errors=True)
@@ -441,8 +472,35 @@ async def get_job(job_id: str) -> dict[str, Any]:
         "download_size_bytes": job.output_path.stat().st_size if job.output_path and job.output_path.exists() else None,
         "unpacked_size_bytes": unpacked_zip_size(job.output_path) if job.output_path and job.output_path.exists() else None,
         "created_at": job.created_at.isoformat(),
-        "expires_after_hours": JOB_TTL_HOURS,
+        "expires_after_minutes": JOB_TTL_MINUTES,
     }
+
+
+@app.get("/api/history")
+async def get_history(session_id: str = "") -> dict[str, Any]:
+    history_items = []
+    for job in jobs.values():
+        if session_id and job.session_id != session_id:
+            continue
+        if job.status != "done" or not job.output_path or not job.output_path.exists():
+            continue
+        expires_at = job.updated_at + timedelta(minutes=JOB_TTL_MINUTES)
+        remaining_seconds = max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
+        history_items.append(
+            {
+                "job_id": job.id,
+                "download_name": job.download_name or job.output_path.name,
+                "download_url": f"/api/jobs/{job.id}/download",
+                "download_size_bytes": job.output_path.stat().st_size,
+                "media_format": job.media_format,
+                "is_playlist": job.is_playlist or bool(job.playlist_items),
+                "updated_at": job.updated_at.isoformat(),
+                "expires_at": expires_at.isoformat(),
+                "remaining_seconds": remaining_seconds,
+            }
+        )
+    history_items.sort(key=lambda item: item["updated_at"], reverse=True)
+    return {"items": history_items}
 
 
 @app.get("/api/jobs/{job_id}/download")

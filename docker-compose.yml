@@ -7,7 +7,7 @@ services:
       - "8000:8000"
     environment:
       YTMPX_DATA_DIR: /data
-      YTMPX_JOB_TTL_HOURS: 2
+      YTMPX_JOB_TTL_MINUTES: 30
       YTMPX_MAX_PLAYLIST_ITEMS: 100
     volumes:
       - ./downloads:/data

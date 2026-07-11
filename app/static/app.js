@@ -14,6 +14,9 @@ const manualActions = document.querySelector("#manual-actions");
 const selectAllButton = document.querySelector("#select-all");
 const selectNoneButton = document.querySelector("#select-none");
 const selectInvertButton = document.querySelector("#select-invert");
+const longVideoWarning = document.querySelector("#long-video-warning");
+const longVideoMessage = document.querySelector("#long-video-message");
+const excludeLongVideosButton = document.querySelector("#exclude-long-videos");
 const startButton = document.querySelector("#start-button");
 const probeButton = document.querySelector("#probe-button");
 const jobBox = document.querySelector("#job");
@@ -22,25 +25,35 @@ const jobPercent = document.querySelector("#job-percent");
 const jobProgress = document.querySelector("#job-progress");
 const downloadLink = document.querySelector("#download-link");
 const downloadSize = document.querySelector("#download-size");
+const historyToggle = document.querySelector("#history-toggle");
+const historyCount = document.querySelector("#history-count");
+const historyPanel = document.querySelector("#history-panel");
+const historyRefresh = document.querySelector("#history-refresh");
+const historyEmpty = document.querySelector("#history-empty");
+const historyList = document.querySelector("#history-list");
 
 const metaTitle = document.querySelector("#meta-title");
 const metaArtist = document.querySelector("#meta-artist");
 const metaAlbum = document.querySelector("#meta-album");
 const metaCover = document.querySelector("#meta-cover");
+const metaCoverLabel = metaCover.closest("label");
 const qualitySelect = document.querySelector("#quality-select");
 
 let currentProbe = null;
 let currentJob = null;
 let pollTimer = null;
 let selectedPlaylistItems = new Set();
-let selectedAudioQuality = "high";
+let selectedAudioQuality = "medium";
 let selectedVideoQuality = "best_compatible";
+const longVideoThresholdSeconds = 10 * 60;
+const qualityPreferenceCookie = "yt2mpx-quality-preferences";
 
 const qualityOptions = {
   mp3: [
     ["high", "Hoch"],
     ["medium", "Mittel"],
     ["small", "Klein"],
+    ["minimal", "Minimal"],
   ],
   mp4: [
     ["best_compatible", "Beste kompatible"],
@@ -53,8 +66,45 @@ const qualityOptions = {
 const sessionIdKey = "yt2mpx-session-id";
 let sessionId = localStorage.getItem(sessionIdKey);
 if (!sessionId) {
-  sessionId = crypto.randomUUID();
+  sessionId = crypto.randomUUID?.() || `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   localStorage.setItem(sessionIdKey, sessionId);
+}
+
+function readCookie(name) {
+  const prefix = `${name}=`;
+  const cookie = document.cookie
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(prefix));
+  return cookie ? cookie.slice(prefix.length) : "";
+}
+
+function isValidQuality(format, value) {
+  return qualityOptions[format]?.some(([optionValue]) => optionValue === value) || false;
+}
+
+function loadQualityPreferences() {
+  const rawPreferences = readCookie(qualityPreferenceCookie);
+  if (!rawPreferences) return;
+  try {
+    const preferences = JSON.parse(decodeURIComponent(rawPreferences));
+    if (isValidQuality("mp3", preferences.audio)) {
+      selectedAudioQuality = preferences.audio;
+    }
+    if (isValidQuality("mp4", preferences.video)) {
+      selectedVideoQuality = preferences.video;
+    }
+  } catch {
+    document.cookie = `${qualityPreferenceCookie}=; path=/; max-age=0; SameSite=Lax`;
+  }
+}
+
+function saveQualityPreferences() {
+  const preferences = encodeURIComponent(JSON.stringify({
+    audio: selectedAudioQuality,
+    video: selectedVideoQuality,
+  }));
+  document.cookie = `${qualityPreferenceCookie}=${preferences}; path=/; SameSite=Lax`;
 }
 
 function setNotice(text, isError = false) {
@@ -90,6 +140,12 @@ function formatBytes(bytes) {
   return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 
+function formatRemaining(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "läuft gleich ab";
+  const minutes = Math.max(1, Math.ceil(seconds / 60));
+  return minutes === 1 ? "noch 1 min" : `noch ${minutes} min`;
+}
+
 function updateDownloadSize(data) {
   const downloadText = formatBytes(data.download_size_bytes);
   const unpackedText = formatBytes(data.unpacked_size_bytes);
@@ -105,8 +161,49 @@ function updateDownloadSize(data) {
   downloadSize.classList.remove("hidden");
 }
 
+function renderHistory(items) {
+  historyCount.textContent = items.length;
+  historyEmpty.classList.toggle("hidden", items.length > 0);
+  historyList.replaceChildren();
+
+  for (const item of items) {
+    const li = document.createElement("li");
+    const link = document.createElement("a");
+    link.href = item.download_url;
+    link.download = item.download_name || "";
+    link.textContent = item.download_name || "Download";
+
+    const meta = document.createElement("span");
+    meta.textContent = [
+      formatBytes(item.download_size_bytes),
+      item.is_playlist ? "ZIP" : item.media_format?.toUpperCase(),
+      formatRemaining(item.remaining_seconds),
+    ].filter(Boolean).join(" / ");
+
+    li.append(link, meta);
+    historyList.appendChild(li);
+  }
+}
+
+async function refreshHistory() {
+  try {
+    const response = await fetch(`/api/history?session_id=${encodeURIComponent(sessionId)}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "History nicht verfügbar");
+    renderHistory(data.items || []);
+  } catch {
+    historyCount.textContent = "!";
+  }
+}
+
 function playlistPositions() {
   return (currentProbe?.entries || []).map((item) => item.position).filter((position) => Number.isInteger(position));
+}
+
+function longVideoPositions() {
+  return (currentProbe?.entries || [])
+    .filter((item) => Number.isFinite(item.duration) && item.duration > longVideoThresholdSeconds)
+    .map((item) => item.position);
 }
 
 function parseNumberList(text, validPositions) {
@@ -174,7 +271,12 @@ function syncCheckboxes() {
 
 function updatePlaylistSummary() {
   const total = playlistPositions().length;
-  playlistSummary.textContent = `${selectedPlaylistItems.size} von ${total} Tracks ausgewaehlt`;
+  const selectedLongVideos = longVideoPositions().filter((position) => selectedPlaylistItems.has(position));
+  playlistSummary.textContent = `${selectedPlaylistItems.size} von ${total} Tracks ausgewählt`;
+  longVideoWarning.classList.toggle("hidden", selectedLongVideos.length === 0);
+  longVideoMessage.textContent = selectedLongVideos.length === 1
+    ? "1 ausgewähltes Video ist länger als 10 Minuten."
+    : `${selectedLongVideos.length} ausgewählte Videos sind länger als 10 Minuten.`;
   startButton.disabled = total > 0 && selectedPlaylistItems.size === 0;
 }
 
@@ -190,6 +292,28 @@ function currentFormat() {
   return document.querySelector("input[name='format']:checked").value;
 }
 
+function isMinimalAudioSelected() {
+  return currentFormat() === "mp3" && selectedAudioQuality === "minimal";
+}
+
+function syncCoverFieldState() {
+  const isPlaylist = currentProbe?.type === "playlist";
+  const isMinimalAudio = isMinimalAudioSelected();
+  metaCover.disabled = isPlaylist || isMinimalAudio;
+  metaCoverLabel.classList.toggle("field-muted", metaCover.disabled);
+
+  if (isMinimalAudio) {
+    metaCover.placeholder = "MP3 Minimal nutzt kein Cover";
+    metaCover.title = "Bei MP3 Minimal wird kein Cover eingebettet.";
+  } else if (isPlaylist) {
+    metaCover.placeholder = "Playlist nutzt je Track das jeweilige Video-Cover";
+    metaCover.title = "Bei Playlists wird je Track das jeweilige Video-Cover genutzt.";
+  } else {
+    metaCover.placeholder = "";
+    metaCover.title = "";
+  }
+}
+
 function syncQualityOptions() {
   const format = currentFormat();
   const selectedValue = format === "mp3" ? selectedAudioQuality : selectedVideoQuality;
@@ -201,6 +325,7 @@ function syncQualityOptions() {
     qualitySelect.appendChild(option);
   }
   qualitySelect.value = selectedValue;
+  syncCoverFieldState();
 }
 
 async function postJson(url, payload) {
@@ -231,7 +356,7 @@ function fillProbe(data) {
   thumbnail.src = data.thumbnail || "";
   mediaType.textContent = data.type === "playlist" ? "Playlist" : "Video";
   mediaTitle.textContent = data.title;
-  mediaCount.textContent = data.type === "playlist" ? `${data.count} Eintraege` : "1 Eintrag";
+  mediaCount.textContent = data.type === "playlist" ? `${data.count} Einträge` : "1 Eintrag";
 
   const metadata = data.suggested_metadata || {};
   metaTitle.value = metadata.title || "";
@@ -242,13 +367,13 @@ function fillProbe(data) {
   entries.replaceChildren();
   if (data.entries && data.entries.length > 0) {
     playlistDetails.classList.remove("hidden");
-    playlistDetails.open = true;
+    playlistDetails.open = false;
     selectedPlaylistItems = new Set(data.entries.map((item) => item.position));
     syncRuleFromSelection();
-    metaCover.disabled = true;
-    metaCover.placeholder = "Playlist nutzt je Track das jeweilige Video-Cover";
     for (const item of data.entries) {
       const li = document.createElement("li");
+      const isLongVideo = Number.isFinite(item.duration) && item.duration > longVideoThresholdSeconds;
+      li.classList.toggle("long-track", isLongVideo);
       const label = document.createElement("label");
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
@@ -271,6 +396,12 @@ function fillProbe(data) {
       title.className = "track-title";
       title.textContent = item.title || "Unbenannter Eintrag";
       label.append(checkbox, position, title);
+      if (isLongVideo) {
+        const badge = document.createElement("span");
+        badge.className = "track-badge";
+        badge.textContent = ">10 min";
+        label.appendChild(badge);
+      }
       li.appendChild(label);
       entries.appendChild(li);
     }
@@ -279,10 +410,11 @@ function fillProbe(data) {
     playlistDetails.classList.add("hidden");
     playlistDetails.open = false;
     selectedPlaylistItems = new Set();
-    metaCover.disabled = false;
-    metaCover.placeholder = "";
+    longVideoWarning.classList.add("hidden");
+    longVideoMessage.textContent = "";
     updatePlaylistSummary();
   }
+  syncCoverFieldState();
 }
 
 async function pollJob(jobId) {
@@ -304,8 +436,9 @@ async function pollJob(jobId) {
     downloadLink.download = data.download_name || "";
     downloadLink.classList.remove("hidden");
     updateDownloadSize(data);
-    setNotice(`Fertig. Der Download wird ${data.expires_after_hours} Stunden bereitgehalten.`);
+    setNotice(`Fertig. Der Download wird ${data.expires_after_minutes} Minuten bereitgehalten.`);
     startButton.disabled = false;
+    refreshHistory();
   }
 
   if (data.status === "failed") {
@@ -320,7 +453,7 @@ form.addEventListener("submit", async (event) => {
   event.preventDefault();
   result.classList.add("hidden");
   resetJobUi();
-  setNotice("Link wird geprueft...");
+  setNotice("Link wird geprüft...");
   probeButton.disabled = true;
   startButton.disabled = false;
   try {
@@ -388,7 +521,10 @@ qualitySelect.addEventListener("change", () => {
   } else {
     selectedVideoQuality = qualitySelect.value;
   }
+  syncCoverFieldState();
+  saveQualityPreferences();
 });
+loadQualityPreferences();
 syncQualityOptions();
 
 selectAllButton.addEventListener("click", () => {
@@ -411,3 +547,31 @@ selectInvertButton.addEventListener("click", () => {
   syncCheckboxes();
   updatePlaylistSummary();
 });
+
+excludeLongVideosButton.addEventListener("click", () => {
+  const longVideos = new Set(longVideoPositions());
+  selectedPlaylistItems = new Set([...selectedPlaylistItems].filter((position) => !longVideos.has(position)));
+  syncRuleFromSelection();
+  syncCheckboxes();
+  updatePlaylistSummary();
+});
+
+historyToggle.addEventListener("click", () => {
+  const isOpen = !historyPanel.classList.contains("hidden");
+  historyPanel.classList.toggle("hidden", isOpen);
+  historyToggle.setAttribute("aria-expanded", String(!isOpen));
+  if (isOpen) return;
+  refreshHistory();
+});
+
+historyRefresh.addEventListener("click", refreshHistory);
+
+document.addEventListener("click", (event) => {
+  if (historyPanel.classList.contains("hidden")) return;
+  if (event.target.closest(".temp-history")) return;
+  historyPanel.classList.add("hidden");
+  historyToggle.setAttribute("aria-expanded", "false");
+});
+
+setInterval(refreshHistory, 30000);
+refreshHistory();

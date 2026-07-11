@@ -3,23 +3,54 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#079d91" />
+    <meta name="apple-mobile-web-app-title" content="yt2mpX" />
     <title>yt2mpX</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <link rel="stylesheet" href="/styles.css?v=20260711-minimal-cover-state" />
   </head>
   <body>
     <main class="shell">
+      <div class="hud-corner hud-corner-left" aria-hidden="true"></div>
+      <div class="hud-corner hud-corner-right" aria-hidden="true"></div>
+      <div class="scan-line scan-line-left" aria-hidden="true"></div>
+      <div class="scan-line scan-line-right" aria-hidden="true"></div>
+
+      <aside class="temp-history" aria-label="Temporäre Downloads">
+        <button id="history-toggle" class="history-toggle" type="button" aria-expanded="false" aria-controls="history-panel">
+          Temp History <span id="history-count">0</span>
+        </button>
+        <div id="history-panel" class="history-panel hidden">
+          <div class="history-head">
+            <strong>Temp History</strong>
+            <button id="history-refresh" class="history-refresh" type="button" aria-label="History aktualisieren">↻</button>
+          </div>
+          <p id="history-empty" class="history-empty">Noch keine fertigen Downloads.</p>
+          <ol id="history-list" class="history-list"></ol>
+        </div>
+      </aside>
+
       <section class="panel">
         <div class="brand">
-          <span class="mark">yX</span>
+          <div class="brand-lockup">
+            <span class="system-code"><strong>001</strong> DEEP MINIMAL TECH SYSTEM</span>
+            <svg class="wordmark" viewBox="0 0 520 150" role="img" aria-label="yt2mpX">
+              <text x="20" y="98">yt2mpX</text>
+              <path d="M25 116h150M192 116h72M282 116h206" class="wordmark-rule"></path>
+              <path d="M42 42h36M154 42h52M320 42h44M420 42h52" class="wordmark-cut"></path>
+              <path d="M38 128h8M54 128h8M70 128h8M86 128h8M102 128h8M118 128h8" class="wordmark-barcode"></path>
+            </svg>
+          </div>
           <div>
-            <h1>yt2mpX</h1>
-            <p>Lokaler Downloader fuer dein Heimnetz.</p>
+            <h1>Lokaler Downloader</h1>
+            <p>Link prüfen. Format wählen. Im Heimnetz sichern.</p>
           </div>
         </div>
 
         <form id="probe-form" class="url-row">
-          <input id="url" name="url" type="url" placeholder="YouTube Link oder Playlist einfuegen" required />
-          <button id="probe-button" type="submit">Pruefen</button>
+          <input id="url" name="url" type="url" placeholder="YouTube Link oder Playlist einfügen" required />
+          <button id="probe-button" type="submit">Prüfen</button>
         </form>
 
         <p id="notice" class="notice" role="status"></p>
@@ -40,7 +71,7 @@
               <label><input type="radio" name="format" value="mp4" /> MP4</label>
             </div>
             <label class="quality-control">
-              Qualitaet
+              Qualität
               <select id="quality-select"></select>
             </label>
           </div>
@@ -52,6 +83,11 @@
             <label>Cover URL <input id="meta-cover" type="url" /></label>
           </div>
 
+          <div id="long-video-warning" class="long-video-warning hidden">
+            <span id="long-video-message"></span>
+            <button id="exclude-long-videos" type="button">Videos über 10 min ausschließen</button>
+          </div>
+
           <details id="playlist-details" class="playlist hidden">
             <summary>Playlist-Auswahl</summary>
             <div class="playlist-controls">
@@ -59,10 +95,10 @@
                 Bereich
                 <input id="playlist-rule" type="text" placeholder="1-20, 1-20,45,60 oder 4,8,12" />
               </label>
-              <span id="playlist-summary" class="selection-summary">0 von 0 Tracks ausgewaehlt</span>
+              <span id="playlist-summary" class="selection-summary">0 von 0 Tracks ausgewählt</span>
             </div>
             <div id="manual-actions" class="manual-actions hidden">
-              <button id="select-all" type="button">Alle auswaehlen</button>
+              <button id="select-all" type="button">Alle auswählen</button>
               <button id="select-none" type="button">Keine</button>
               <button id="select-invert" type="button">Auswahl umkehren</button>
             </div>
@@ -83,6 +119,6 @@
         </section>
       </section>
     </main>
-    <script src="/app.js"></script>
+    <script src="/app.js?v=20260711-minimal-cover-state"></script>
   </body>
 </html>
