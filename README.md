@@ -1,3 +1,5 @@
+![yt2mpX banner — local media downloader](assets/yt2mpx-banner.png)
+
 # yt2mpX
 
 A local web app for Raspberry Pi: paste a YouTube video or playlist URL, choose MP3 or MP4, review the metadata, and download the finished file in your browser.
