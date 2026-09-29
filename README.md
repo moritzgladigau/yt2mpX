@@ -42,11 +42,17 @@ The main settings are in `docker-compose.yml`. You can add other environment var
 - `YTMPX_MUSICBRAINZ_USER_AGENT`: MusicBrainz user agent, ideally with contact information.
 - `./downloads:/data`: Local storage for temporary job files. Completed jobs are stored under `./downloads/jobs/<job_id>/`.
 
-For example, to provide an AcoustID key:
+To configure these integrations, copy the template to `.env` and edit its values:
 
 ```bash
-YTMPX_ACOUSTID_API_KEY=your_key docker compose up --build
+cp -n .env.example .env
 ```
+
+Docker Compose reads `.env` automatically. To enable fingerprint matching, sign in to AcoustID and [register an application](https://acoustid.org/new-application). Put its **Application API Key** in `YTMPX_ACOUSTID_API_KEY` (not your AcoustID user key). Leave this field empty to use fallback metadata.
+
+MusicBrainz does not require an API key for metadata lookups. Set `YTMPX_MUSICBRAINZ_USER_AGENT` to an application name and version with a contact URL or email address, following the [MusicBrainz User-Agent guidelines](https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting#Provide_meaningful_User-Agent_strings).
+
+Keep `.env` private; only `.env.example`, which contains no credentials, belongs in Git.
 
 ## Quality options
 
