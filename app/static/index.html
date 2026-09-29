@@ -8,7 +8,7 @@
     <title>yt2mpX</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="manifest" href="/site.webmanifest" />
-    <link rel="stylesheet" href="/styles.css?v=20260711-minimal-cover-state" />
+    <link rel="stylesheet" href="/styles.css?v=20260711-workflow-progress" />
   </head>
   <body>
     <main class="shell">
@@ -75,13 +75,10 @@
               <select id="quality-select"></select>
             </label>
           </div>
-
-          <div class="fields">
-            <label>Titel <input id="meta-title" type="text" /></label>
-            <label>Artist <input id="meta-artist" type="text" /></label>
-            <label>Album <input id="meta-album" type="text" /></label>
-            <label>Cover URL <input id="meta-cover" type="url" /></label>
-          </div>
+          <label id="cover-toggle" class="cover-toggle hidden">
+            <input id="minimal-cover" type="checkbox" />
+            Cover einbetten
+          </label>
 
           <div id="long-video-warning" class="long-video-warning hidden">
             <span id="long-video-message"></span>
@@ -105,20 +102,32 @@
             <ol id="entries"></ol>
           </details>
 
-          <button id="start-button" class="primary" type="button">Download starten</button>
+          <button id="start-button" class="primary" type="button">Metadaten prüfen</button>
         </section>
 
         <section id="job" class="job hidden">
           <div class="job-top">
-            <strong id="job-message">Wartet</strong>
+            <strong id="job-phase">Wartet</strong>
             <span id="job-percent">0%</span>
           </div>
           <progress id="job-progress" max="100" value="0"></progress>
+          <p id="job-message" class="job-message">Wartet</p>
           <a id="download-link" class="download hidden">Datei herunterladen</a>
           <p id="download-size" class="download-size hidden"></p>
         </section>
+
+        <section id="metadata-review" class="metadata-review hidden">
+          <div class="review-head">
+            <h2>Metadaten prüfen</h2>
+            <p id="review-summary"></p>
+          </div>
+          <div id="review-list" class="review-list"></div>
+          <div class="review-actions">
+            <button id="finalize-button" class="primary" type="button">Tagging/ZIP starten</button>
+          </div>
+        </section>
       </section>
     </main>
-    <script src="/app.js?v=20260711-minimal-cover-state"></script>
+    <script src="/app.js?v=20260711-workflow-progress"></script>
   </body>
 </html>

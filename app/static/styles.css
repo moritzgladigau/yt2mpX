@@ -405,22 +405,26 @@ button:disabled {
   width: min(240px, 100%);
 }
 
-.fields {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-}
-
-.fields label {
-  display: grid;
-  gap: 6px;
-  color: var(--muted);
+.cover-toggle {
+  display: inline-flex;
+  width: fit-content;
+  min-height: 40px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.42);
+  color: var(--ink);
+  padding: 8px 12px;
   font-size: 14px;
-  font-weight: 700;
+  font-weight: 800;
 }
 
-.fields label.field-muted {
-  color: rgba(48, 58, 77, 0.52);
+.cover-toggle input {
+  width: 18px;
+  height: 18px;
+  min-height: 18px;
+  margin: 0;
+  padding: 0;
 }
 
 .playlist summary {
@@ -576,6 +580,11 @@ button:disabled {
   gap: 16px;
 }
 
+.job-message {
+  color: var(--muted);
+  font-size: 14px;
+}
+
 progress {
   width: 100%;
   height: 16px;
@@ -592,6 +601,117 @@ progress {
   color: var(--muted);
   font-size: 14px;
   text-align: center;
+}
+
+.metadata-review {
+  display: grid;
+  gap: 16px;
+  margin-top: 18px;
+  border-top: 1px solid var(--line);
+  padding-top: 18px;
+}
+
+.review-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.review-head p,
+.review-source {
+  color: var(--muted);
+}
+
+.review-list {
+  display: grid;
+  gap: 12px;
+  max-height: min(520px, 52dvh);
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.review-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.38);
+  padding: 12px;
+}
+
+.review-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.review-card-head strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.match-pill {
+  display: inline-flex;
+  width: fit-content;
+  border: 1px solid var(--line);
+  padding: 4px 8px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.match-pill.matched {
+  border-color: rgba(7, 157, 145, 0.42);
+  color: var(--accent-dark);
+}
+
+.match-pill.fallback {
+  border-color: rgba(245, 158, 11, 0.5);
+  color: #92400e;
+}
+
+.review-source {
+  font-size: 13px;
+}
+
+.review-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.review-fields.extra {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.review-fields label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.review-fields input {
+  min-height: 40px;
+  font-size: 15px;
+}
+
+.review-details summary {
+  cursor: pointer;
+  color: var(--ink);
+  font-weight: 800;
+}
+
+.review-actions {
+  display: flex;
+  justify-content: center;
 }
 
 .temp-history {
@@ -797,7 +917,6 @@ progress {
   .url-row,
   .format-quality-row,
   .media-head,
-  .fields,
   .playlist-controls {
     grid-template-columns: 1fr;
   }
@@ -805,10 +924,6 @@ progress {
   .quality-control {
     justify-self: stretch;
     width: 100%;
-  }
-
-  .fields {
-    gap: 10px;
   }
 
   .long-video-warning {
@@ -822,6 +937,17 @@ progress {
 
   .playlist ol {
     max-height: 180px;
+  }
+
+  .review-list {
+    max-height: none;
+    overflow: visible;
+    padding-right: 0;
+  }
+
+  .review-fields,
+  .review-fields.extra {
+    grid-template-columns: 1fr;
   }
 
   .primary,

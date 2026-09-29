@@ -9,5 +9,7 @@ services:
       YTMPX_DATA_DIR: /data
       YTMPX_JOB_TTL_MINUTES: 30
       YTMPX_MAX_PLAYLIST_ITEMS: 100
+      YTMPX_ACOUSTID_API_KEY: "${YTMPX_ACOUSTID_API_KEY:-}"
+      YTMPX_MUSICBRAINZ_USER_AGENT: "${YTMPX_MUSICBRAINZ_USER_AGENT:-yt2mpX/1.0 (local-home-use)}"
     volumes:
       - ./downloads:/data

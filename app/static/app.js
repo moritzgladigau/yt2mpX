@@ -20,23 +20,24 @@ const excludeLongVideosButton = document.querySelector("#exclude-long-videos");
 const startButton = document.querySelector("#start-button");
 const probeButton = document.querySelector("#probe-button");
 const jobBox = document.querySelector("#job");
+const jobPhase = document.querySelector("#job-phase");
 const jobMessage = document.querySelector("#job-message");
 const jobPercent = document.querySelector("#job-percent");
 const jobProgress = document.querySelector("#job-progress");
 const downloadLink = document.querySelector("#download-link");
 const downloadSize = document.querySelector("#download-size");
+const metadataReview = document.querySelector("#metadata-review");
+const reviewSummary = document.querySelector("#review-summary");
+const reviewList = document.querySelector("#review-list");
+const finalizeButton = document.querySelector("#finalize-button");
+const coverToggle = document.querySelector("#cover-toggle");
+const coverInput = document.querySelector("#minimal-cover");
 const historyToggle = document.querySelector("#history-toggle");
 const historyCount = document.querySelector("#history-count");
 const historyPanel = document.querySelector("#history-panel");
 const historyRefresh = document.querySelector("#history-refresh");
 const historyEmpty = document.querySelector("#history-empty");
 const historyList = document.querySelector("#history-list");
-
-const metaTitle = document.querySelector("#meta-title");
-const metaArtist = document.querySelector("#meta-artist");
-const metaAlbum = document.querySelector("#meta-album");
-const metaCover = document.querySelector("#meta-cover");
-const metaCoverLabel = metaCover.closest("label");
 const qualitySelect = document.querySelector("#quality-select");
 
 let currentProbe = null;
@@ -45,15 +46,16 @@ let pollTimer = null;
 let selectedPlaylistItems = new Set();
 let selectedAudioQuality = "medium";
 let selectedVideoQuality = "best_compatible";
+let embedCover = true;
 const longVideoThresholdSeconds = 10 * 60;
 const qualityPreferenceCookie = "yt2mpx-quality-preferences";
 
 const qualityOptions = {
   mp3: [
-    ["high", "Hoch"],
-    ["medium", "Mittel"],
-    ["small", "Klein"],
-    ["minimal", "Minimal"],
+    ["high", "Hoch (VBR 0)"],
+    ["medium", "Mittel (192 kbps)"],
+    ["small", "Klein (128 kbps)"],
+    ["minimal", "Minimal (32 kbps, kleinste Quelle)"],
   ],
   mp4: [
     ["best_compatible", "Beste kompatible"],
@@ -61,6 +63,17 @@ const qualityOptions = {
     ["720", "720p"],
     ["360", "360p"],
   ],
+};
+
+const phaseLabels = {
+  download: "Download",
+  convert: "Konvertierung",
+  fingerprint: "Fingerprint",
+  musicbrainz: "MusicBrainz",
+  review: "Review",
+  finalize: "Tagging/ZIP",
+  done: "Fertig",
+  queued: "Wartet",
 };
 
 const sessionIdKey = "yt2mpx-session-id";
@@ -88,11 +101,20 @@ function loadQualityPreferences() {
   if (!rawPreferences) return;
   try {
     const preferences = JSON.parse(decodeURIComponent(rawPreferences));
-    if (isValidQuality("mp3", preferences.audio)) {
+    if (preferences.audio === "minimal_cover") {
+      selectedAudioQuality = "minimal";
+      embedCover = true;
+    } else if (isValidQuality("mp3", preferences.audio)) {
       selectedAudioQuality = preferences.audio;
     }
     if (isValidQuality("mp4", preferences.video)) {
       selectedVideoQuality = preferences.video;
+    }
+    if (typeof preferences.minimalCover === "boolean") {
+      embedCover = preferences.minimalCover;
+    }
+    if (typeof preferences.embedCover === "boolean") {
+      embedCover = preferences.embedCover;
     }
   } catch {
     document.cookie = `${qualityPreferenceCookie}=; path=/; max-age=0; SameSite=Lax`;
@@ -103,6 +125,7 @@ function saveQualityPreferences() {
   const preferences = encodeURIComponent(JSON.stringify({
     audio: selectedAudioQuality,
     video: selectedVideoQuality,
+    embedCover,
   }));
   document.cookie = `${qualityPreferenceCookie}=${preferences}; path=/; SameSite=Lax`;
 }
@@ -117,6 +140,10 @@ function resetJobUi() {
   pollTimer = null;
   currentJob = null;
   jobBox.classList.add("hidden");
+  metadataReview.classList.add("hidden");
+  reviewList.replaceChildren();
+  reviewSummary.textContent = "";
+  finalizeButton.disabled = false;
   downloadLink.classList.add("hidden");
   downloadLink.removeAttribute("href");
   downloadLink.removeAttribute("download");
@@ -124,7 +151,9 @@ function resetJobUi() {
   downloadSize.textContent = "";
   jobProgress.value = 0;
   jobPercent.textContent = "0%";
+  jobPhase.textContent = "Wartet";
   jobMessage.textContent = "Wartet";
+  updateJobProgress({ status: "queued", progress: 0, message: "Wartet" });
 }
 
 function formatBytes(bytes) {
@@ -292,28 +321,6 @@ function currentFormat() {
   return document.querySelector("input[name='format']:checked").value;
 }
 
-function isMinimalAudioSelected() {
-  return currentFormat() === "mp3" && selectedAudioQuality === "minimal";
-}
-
-function syncCoverFieldState() {
-  const isPlaylist = currentProbe?.type === "playlist";
-  const isMinimalAudio = isMinimalAudioSelected();
-  metaCover.disabled = isPlaylist || isMinimalAudio;
-  metaCoverLabel.classList.toggle("field-muted", metaCover.disabled);
-
-  if (isMinimalAudio) {
-    metaCover.placeholder = "MP3 Minimal nutzt kein Cover";
-    metaCover.title = "Bei MP3 Minimal wird kein Cover eingebettet.";
-  } else if (isPlaylist) {
-    metaCover.placeholder = "Playlist nutzt je Track das jeweilige Video-Cover";
-    metaCover.title = "Bei Playlists wird je Track das jeweilige Video-Cover genutzt.";
-  } else {
-    metaCover.placeholder = "";
-    metaCover.title = "";
-  }
-}
-
 function syncQualityOptions() {
   const format = currentFormat();
   const selectedValue = format === "mp3" ? selectedAudioQuality : selectedVideoQuality;
@@ -325,7 +332,13 @@ function syncQualityOptions() {
     qualitySelect.appendChild(option);
   }
   qualitySelect.value = selectedValue;
-  syncCoverFieldState();
+  syncCoverToggle();
+}
+
+function syncCoverToggle() {
+  const showToggle = currentFormat() === "mp3";
+  coverToggle.classList.toggle("hidden", !showToggle);
+  coverInput.checked = embedCover;
 }
 
 async function postJson(url, payload) {
@@ -358,16 +371,10 @@ function fillProbe(data) {
   mediaTitle.textContent = data.title;
   mediaCount.textContent = data.type === "playlist" ? `${data.count} Einträge` : "1 Eintrag";
 
-  const metadata = data.suggested_metadata || {};
-  metaTitle.value = metadata.title || "";
-  metaArtist.value = metadata.artist || "";
-  metaAlbum.value = metadata.album || "";
-  metaCover.value = metadata.cover_url || data.thumbnail || "";
-
   entries.replaceChildren();
   if (data.entries && data.entries.length > 0) {
     playlistDetails.classList.remove("hidden");
-    playlistDetails.open = false;
+    playlistDetails.open = true;
     selectedPlaylistItems = new Set(data.entries.map((item) => item.position));
     syncRuleFromSelection();
     for (const item of data.entries) {
@@ -414,7 +421,135 @@ function fillProbe(data) {
     longVideoMessage.textContent = "";
     updatePlaylistSummary();
   }
-  syncCoverFieldState();
+}
+
+function phaseForJob(data) {
+  if (data.status === "done") return "done";
+  if (data.status === "finalizing") return "finalize";
+  if (data.status === "review") return "review";
+  if (data.progress >= 78) return "musicbrainz";
+  if (data.progress >= 68) return "fingerprint";
+  if (data.progress >= 60) return "convert";
+  return "download";
+}
+
+function phaseProgress(data, phase) {
+  const progress = Number(data.progress) || 0;
+  if (phase === "download") {
+    return Math.max(0, Math.min(100, ((progress - 1) / 59) * 100));
+  }
+  if (phase === "convert") {
+    return Math.max(0, Math.min(100, ((progress - 60) / 8) * 100));
+  }
+  if (phase === "fingerprint" || phase === "musicbrainz") {
+    return Math.max(0, Math.min(100, ((progress - 68) / 23) * 100));
+  }
+  if (phase === "review") {
+    return 100;
+  }
+  if (phase === "finalize") {
+    return Math.max(0, Math.min(100, ((progress - 92) / 8) * 100));
+  }
+  if (phase === "done") {
+    return 100;
+  }
+  return 0;
+}
+
+function updateJobProgress(data) {
+  const activePhase = phaseForJob(data);
+  const percent = Math.round(phaseProgress(data, activePhase));
+  jobPhase.textContent = phaseLabels[activePhase] || phaseLabels.queued;
+  jobProgress.value = percent;
+  jobPercent.textContent = `${percent}%`;
+  jobMessage.textContent = data.error || data.message || "";
+}
+
+function fieldValue(metadata, field) {
+  return metadata?.[field] || "";
+}
+
+function makeInput(field, label, value, type = "text") {
+  const wrapper = document.createElement("label");
+  wrapper.textContent = label;
+  const input = document.createElement("input");
+  input.type = type;
+  input.dataset.field = field;
+  input.value = value || "";
+  wrapper.appendChild(input);
+  return wrapper;
+}
+
+function renderReview(data) {
+  const tracks = data.tracks || [];
+  const matched = tracks.filter((track) => track.status === "matched").length;
+  metadataReview.classList.remove("hidden");
+  reviewSummary.textContent = `${tracks.length} Track${tracks.length === 1 ? "" : "s"} bereit, ${matched} mit MusicBrainz-Treffer.`;
+  reviewList.replaceChildren();
+
+  for (const track of tracks) {
+    const metadata = track.metadata || {};
+    const article = document.createElement("article");
+    article.className = "review-card";
+    article.dataset.trackId = track.id;
+
+    const head = document.createElement("div");
+    head.className = "review-card-head";
+    const title = document.createElement("strong");
+    title.textContent = `${track.position}. ${fieldValue(metadata, "title") || track.source_title || "Unbenannter Track"}`;
+    const status = document.createElement("span");
+    status.className = track.status === "matched" ? "match-pill matched" : "match-pill fallback";
+    status.textContent = track.status === "matched"
+      ? `Gefunden ${Math.round((track.confidence || 0) * 100)}%`
+      : "Fallback";
+    head.append(title, status);
+
+    const source = document.createElement("p");
+    source.className = "review-source";
+    source.textContent = track.message || track.source_title || track.file_name || "";
+
+    const mainFields = document.createElement("div");
+    mainFields.className = "review-fields";
+    mainFields.append(
+      makeInput("title", "Titel", fieldValue(metadata, "title")),
+      makeInput("artist", "Artist", fieldValue(metadata, "artist")),
+      makeInput("album", "Album", fieldValue(metadata, "album")),
+    );
+
+    const details = document.createElement("details");
+    details.className = "review-details";
+    const summary = document.createElement("summary");
+    summary.textContent = "Weitere Tags";
+    const extraFields = document.createElement("div");
+    extraFields.className = "review-fields extra";
+    extraFields.append(
+      makeInput("date", "Datum/Jahr", fieldValue(metadata, "date")),
+      makeInput("track_number", "Track", fieldValue(metadata, "track_number")),
+      makeInput("disc_number", "Disc", fieldValue(metadata, "disc_number")),
+      makeInput("isrc", "ISRC", fieldValue(metadata, "isrc")),
+      makeInput("cover_url", "Cover URL", fieldValue(metadata, "cover_url"), "url"),
+      makeInput("musicbrainz_recording_id", "MB Recording ID", fieldValue(metadata, "musicbrainz_recording_id")),
+      makeInput("musicbrainz_release_id", "MB Release ID", fieldValue(metadata, "musicbrainz_release_id")),
+      makeInput("musicbrainz_release_group_id", "MB Release Group ID", fieldValue(metadata, "musicbrainz_release_group_id")),
+    );
+    details.append(summary, extraFields);
+
+    article.append(head, source, mainFields, details);
+    reviewList.appendChild(article);
+  }
+}
+
+function collectReviewTracks() {
+  return [...reviewList.querySelectorAll(".review-card")].map((card) => {
+    const metadata = {};
+    for (const input of card.querySelectorAll("input[data-field]")) {
+      metadata[input.dataset.field] = input.value.trim();
+    }
+    return {
+      id: card.dataset.trackId,
+      metadata,
+    };
+  });
 }
 
 async function pollJob(jobId) {
@@ -425,19 +560,28 @@ async function pollJob(jobId) {
   }
 
   jobBox.classList.remove("hidden");
-  jobMessage.textContent = data.error || data.message;
-  jobProgress.value = data.progress;
-  jobPercent.textContent = `${Math.round(data.progress)}%`;
+  updateJobProgress(data);
+
+  if (data.status === "review") {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    renderReview(data);
+    setNotice("Metadaten erkannt. Bitte prüfen und dann den Download vorbereiten.");
+    startButton.disabled = false;
+    metadataReview.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
 
   if (data.status === "done") {
     clearInterval(pollTimer);
     pollTimer = null;
+    metadataReview.classList.add("hidden");
     downloadLink.href = `/api/jobs/${jobId}/download`;
     downloadLink.download = data.download_name || "";
     downloadLink.classList.remove("hidden");
     updateDownloadSize(data);
     setNotice(`Fertig. Der Download wird ${data.expires_after_minutes} Minuten bereitgehalten.`);
     startButton.disabled = false;
+    finalizeButton.disabled = false;
     refreshHistory();
   }
 
@@ -446,6 +590,7 @@ async function pollJob(jobId) {
     pollTimer = null;
     setNotice(data.error || "Download fehlgeschlagen", true);
     startButton.disabled = false;
+    finalizeButton.disabled = false;
   }
 }
 
@@ -473,22 +618,18 @@ form.addEventListener("submit", async (event) => {
 startButton.addEventListener("click", async () => {
   if (!currentProbe) return;
   resetJobUi();
-  setNotice("Job wird gestartet...");
+  setNotice("Metadaten-Prüfung wird gestartet...");
   startButton.disabled = true;
+  playlistDetails.open = false;
 
   const format = currentFormat();
   const payload = {
     url: urlInput.value.trim(),
     format,
     audio_quality: selectedAudioQuality,
+    embed_cover: embedCover,
     video_quality: selectedVideoQuality,
     session_id: sessionId,
-    metadata: {
-      title: metaTitle.value.trim(),
-      artist: metaArtist.value.trim(),
-      album: metaAlbum.value.trim(),
-      cover_url: metaCover.value.trim(),
-    },
   };
   if (currentProbe.type === "playlist") {
     payload.playlist_items = [...selectedPlaylistItems].sort((a, b) => a - b);
@@ -500,12 +641,30 @@ startButton.addEventListener("click", async () => {
     jobBox.classList.remove("hidden");
     jobProgress.value = 0;
     jobPercent.textContent = "0%";
+    jobPhase.textContent = "Download";
     jobMessage.textContent = "Wartet auf Start";
     setNotice("");
     pollTimer = setInterval(() => pollJob(currentJob).catch((error) => setNotice(error.message, true)), 1500);
     await pollJob(currentJob);
   } catch (error) {
     setNotice(error.message, true);
+    startButton.disabled = false;
+  }
+});
+
+finalizeButton.addEventListener("click", async () => {
+  if (!currentJob) return;
+  finalizeButton.disabled = true;
+  startButton.disabled = true;
+  setNotice("Tags werden geschrieben und Download wird vorbereitet...");
+  try {
+    await postJson(`/api/jobs/${currentJob}/finalize`, { tracks: collectReviewTracks() });
+    metadataReview.classList.add("hidden");
+    pollTimer = setInterval(() => pollJob(currentJob).catch((error) => setNotice(error.message, true)), 1500);
+    await pollJob(currentJob);
+  } catch (error) {
+    setNotice(error.message, true);
+    finalizeButton.disabled = false;
     startButton.disabled = false;
   }
 });
@@ -521,7 +680,11 @@ qualitySelect.addEventListener("change", () => {
   } else {
     selectedVideoQuality = qualitySelect.value;
   }
-  syncCoverFieldState();
+  syncCoverToggle();
+  saveQualityPreferences();
+});
+coverInput.addEventListener("change", () => {
+  embedCover = coverInput.checked;
   saveQualityPreferences();
 });
 loadQualityPreferences();
