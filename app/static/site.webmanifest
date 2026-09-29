@@ -1,7 +1,7 @@
 {
   "name": "yt2mpX",
   "short_name": "yt2mpX",
-  "description": "Lokaler Downloader fuer dein Heimnetz.",
+  "description": "A local downloader for your home network.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

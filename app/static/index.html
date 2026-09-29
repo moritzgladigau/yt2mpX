@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="de">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -17,16 +17,16 @@
       <div class="scan-line scan-line-left" aria-hidden="true"></div>
       <div class="scan-line scan-line-right" aria-hidden="true"></div>
 
-      <aside class="temp-history" aria-label="Temporäre Downloads">
+      <aside class="temp-history" aria-label="Temporary downloads">
         <button id="history-toggle" class="history-toggle" type="button" aria-expanded="false" aria-controls="history-panel">
-          Temp History <span id="history-count">0</span>
+          Temporary downloads <span id="history-count">0</span>
         </button>
         <div id="history-panel" class="history-panel hidden">
           <div class="history-head">
-            <strong>Temp History</strong>
-            <button id="history-refresh" class="history-refresh" type="button" aria-label="History aktualisieren">↻</button>
+            <strong>Temporary downloads</strong>
+            <button id="history-refresh" class="history-refresh" type="button" aria-label="Refresh download history">↻</button>
           </div>
-          <p id="history-empty" class="history-empty">Noch keine fertigen Downloads.</p>
+          <p id="history-empty" class="history-empty">No downloads ready yet.</p>
           <ol id="history-list" class="history-list"></ol>
         </div>
       </aside>
@@ -43,14 +43,14 @@
             </svg>
           </div>
           <div>
-            <h1>Lokaler Downloader</h1>
-            <p>Link prüfen. Format wählen. Im Heimnetz sichern.</p>
+            <h1>Local downloader</h1>
+            <p>Check a link. Choose a format. Download on your home network.</p>
           </div>
         </div>
 
         <form id="probe-form" class="url-row">
-          <input id="url" name="url" type="url" placeholder="YouTube Link oder Playlist einfügen" required />
-          <button id="probe-button" type="submit">Prüfen</button>
+          <input id="url" name="url" type="url" placeholder="Paste a YouTube video or playlist URL" required />
+          <button id="probe-button" type="submit">Check link</button>
         </form>
 
         <p id="notice" class="notice" role="status"></p>
@@ -71,59 +71,59 @@
               <label><input type="radio" name="format" value="mp4" /> MP4</label>
             </div>
             <label class="quality-control">
-              Qualität
+              Quality
               <select id="quality-select"></select>
             </label>
           </div>
           <label id="cover-toggle" class="cover-toggle hidden">
             <input id="minimal-cover" type="checkbox" />
-            Cover einbetten
+            Embed cover art
           </label>
 
           <div id="long-video-warning" class="long-video-warning hidden">
             <span id="long-video-message"></span>
-            <button id="exclude-long-videos" type="button">Videos über 10 min ausschließen</button>
+            <button id="exclude-long-videos" type="button">Exclude videos over 10 minutes</button>
           </div>
 
           <details id="playlist-details" class="playlist hidden">
-            <summary>Playlist-Auswahl</summary>
+            <summary>Playlist selection</summary>
             <div class="playlist-controls">
               <label class="playlist-rule">
-                Bereich
-                <input id="playlist-rule" type="text" placeholder="1-20, 1-20,45,60 oder 4,8,12" />
+                Range
+                <input id="playlist-rule" type="text" placeholder="1-20, 1-20,45,60 or 4,8,12" />
               </label>
-              <span id="playlist-summary" class="selection-summary">0 von 0 Tracks ausgewählt</span>
+              <span id="playlist-summary" class="selection-summary">0 of 0 tracks selected</span>
             </div>
             <div id="manual-actions" class="manual-actions hidden">
-              <button id="select-all" type="button">Alle auswählen</button>
-              <button id="select-none" type="button">Keine</button>
-              <button id="select-invert" type="button">Auswahl umkehren</button>
+              <button id="select-all" type="button">Select all</button>
+              <button id="select-none" type="button">Select none</button>
+              <button id="select-invert" type="button">Invert selection</button>
             </div>
             <ol id="entries"></ol>
           </details>
 
-          <button id="start-button" class="primary" type="button">Metadaten prüfen</button>
+          <button id="start-button" class="primary" type="button">Download and check metadata</button>
         </section>
 
         <section id="job" class="job hidden">
           <div class="job-top">
-            <strong id="job-phase">Wartet</strong>
+            <strong id="job-phase">Waiting</strong>
             <span id="job-percent">0%</span>
           </div>
           <progress id="job-progress" max="100" value="0"></progress>
-          <p id="job-message" class="job-message">Wartet</p>
-          <a id="download-link" class="download hidden">Datei herunterladen</a>
+          <p id="job-message" class="job-message">Waiting</p>
+          <a id="download-link" class="download hidden">Download file</a>
           <p id="download-size" class="download-size hidden"></p>
         </section>
 
         <section id="metadata-review" class="metadata-review hidden">
           <div class="review-head">
-            <h2>Metadaten prüfen</h2>
+            <h2>Review metadata</h2>
             <p id="review-summary"></p>
           </div>
           <div id="review-list" class="review-list"></div>
           <div class="review-actions">
-            <button id="finalize-button" class="primary" type="button">Tagging/ZIP starten</button>
+            <button id="finalize-button" class="primary" type="button">Apply tags and prepare download</button>
           </div>
         </section>
       </section>

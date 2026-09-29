@@ -108,7 +108,7 @@ class Job:
     video_quality: str = "best_compatible"
     status: str = "queued"
     progress: float = 0
-    message: str = "Wartet auf Start"
+    message: str = "Waiting to start"
     error: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -152,14 +152,14 @@ def run_probe(url: str) -> dict[str, Any]:
             {
                 "position": position,
                 "id": entry.get("id"),
-                "title": entry.get("title") or "Unbenannter Eintrag",
+                "title": entry.get("title") or "Untitled item",
                 "url": entry.get("url") or entry.get("webpage_url"),
                 "duration": entry.get("duration"),
                 "uploader": entry.get("uploader") or entry.get("channel"),
             }
         )
 
-    title = info.get("title") or "Unbenannt"
+    title = info.get("title") or "Untitled"
     artist = info.get("artist") or info.get("uploader") or info.get("channel") or ""
     thumbnail = info.get("thumbnail") or ""
 
@@ -233,7 +233,7 @@ def thumbnail_from_info(info: dict[str, Any]) -> str:
 
 def fallback_metadata(source: dict[str, Any], collection_title: str = "") -> Metadata:
     return Metadata(
-        title=first_text(source.get("track"), source.get("title"), "Unbenannter Track"),
+        title=first_text(source.get("track"), source.get("title"), "Untitled track"),
         artist=first_text(source.get("artist"), source.get("uploader"), source.get("channel")),
         album=first_text(source.get("album"), collection_title),
         cover_url=thumbnail_from_info(source),
@@ -292,7 +292,7 @@ def fpcalc(path: Path) -> tuple[int, str]:
     duration = int(float(data.get("duration") or 0))
     fingerprint = first_text(data.get("fingerprint"))
     if not duration or not fingerprint:
-        raise RuntimeError("Fingerprint konnte nicht erzeugt werden.")
+        raise RuntimeError("Could not generate an audio fingerprint.")
     return duration, fingerprint
 
 
@@ -332,7 +332,7 @@ def candidate_rank(score: float, recording: dict[str, Any], fallback: Metadata) 
 
 def acoustid_lookup(duration: int, fingerprint: str, fallback: Metadata) -> tuple[float, str]:
     if not ACOUSTID_API_KEY:
-        raise RuntimeError("Kein AcoustID API-Key konfiguriert.")
+        raise RuntimeError("No AcoustID API key is configured.")
     data = post_form_json(
         "https://api.acoustid.org/v2/lookup",
         {
@@ -345,7 +345,7 @@ def acoustid_lookup(duration: int, fingerprint: str, fallback: Metadata) -> tupl
     )
     if data.get("status") == "error":
         error = data.get("error") or {}
-        raise RuntimeError(first_text(error.get("message"), "AcoustID hat den Lookup abgelehnt."))
+        raise RuntimeError(first_text(error.get("message"), "AcoustID rejected the lookup."))
     results = data.get("results") or []
     best_acoustid_score = 0.0
     best_rank = 0.0
@@ -363,7 +363,7 @@ def acoustid_lookup(duration: int, fingerprint: str, fallback: Metadata) -> tupl
                 best_acoustid_score = score
                 best_recording_id = recording_id
     if not best_recording_id:
-        raise RuntimeError("AcoustID hat keinen passenden MusicBrainz-Treffer gefunden.")
+        raise RuntimeError("AcoustID found no matching MusicBrainz recording.")
     return best_acoustid_score, best_recording_id
 
 
@@ -442,20 +442,20 @@ def musicbrainz_metadata(recording_id: str, fallback: Metadata) -> Metadata:
 
 def identify_track(path: Path, fallback: Metadata) -> tuple[Metadata, float, str, str]:
     if not ACOUSTID_API_KEY:
-        return fallback, 0, "fallback", "Kein AcoustID API-Key konfiguriert."
+        return fallback, 0, "fallback", "No AcoustID API key is configured."
     try:
         duration, fingerprint = fpcalc(path)
         score, recording_id = acoustid_lookup(duration, fingerprint, fallback)
         if score < ACOUSTID_MIN_SCORE:
-            return fallback, score, "fallback", "AcoustID-Treffer war zu unsicher."
+            return fallback, score, "fallback", "The AcoustID match was too uncertain."
         metadata = musicbrainz_metadata(recording_id, fallback)
-        return metadata, score, "matched", "MusicBrainz-Treffer gefunden."
+        return metadata, score, "matched", "MusicBrainz match found."
     except FileNotFoundError:
-        return fallback, 0, "fallback", "fpcalc ist nicht installiert."
+        return fallback, 0, "fallback", "fpcalc is not installed."
     except Exception as exc:
         message = str(exc)
         if "invalid api key" in message.casefold():
-            message = "AcoustID API-Key ungueltig. Nutze den Application API Key, nicht den User-Key."
+            message = "Invalid AcoustID API key. Use the Application API Key, not a user key."
         return fallback, 0, "fallback", message
 
 
@@ -466,11 +466,11 @@ def progress_hook(job: Job):
             raw_percent = (data.get("_percent_str") or "").strip().replace("%", "")
             try:
                 percent = float(raw_percent)
-                touch(job, status="running", progress=1 + percent * 0.58, message="Download laeuft")
+                touch(job, status="running", progress=1 + percent * 0.58, message="Downloading")
             except ValueError:
-                touch(job, status="running", message="Download laeuft")
+                touch(job, status="running", message="Downloading")
         elif status == "finished":
-            touch(job, status="running", progress=max(job.progress, 62), message="Konvertiere Datei")
+            touch(job, status="running", progress=max(job.progress, 62), message="Converting file")
 
     return hook
 
@@ -811,7 +811,7 @@ def run_job(job: Job) -> None:
     work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        touch(job, status="running", progress=1, message="Pruefe Link")
+        touch(job, status="running", progress=1, message="Checking link")
         with YoutubeDL(ydl_options(job, work_dir)) as ydl:
             info = ydl.extract_info(job.url, download=True)
             job.is_playlist = bool(info.get("entries"))
@@ -819,7 +819,7 @@ def run_job(job: Job) -> None:
 
         files = media_files(work_dir, job.media_format)
         if not files:
-            raise RuntimeError("Keine Ausgabedatei erzeugt.")
+            raise RuntimeError("No output file was created.")
         file_positions = [playlist_position_from_name(path) for path in files]
         if job.playlist_items:
             files = deduplicate_playlist_filenames(files)
@@ -828,17 +828,17 @@ def run_job(job: Job) -> None:
         total_tracks = len(job.tracks)
         for index, track in enumerate(job.tracks, start=1):
             progress = 68 + ((index - 1) / max(total_tracks, 1)) * 20
-            touch(job, progress=progress, message=f"Pruefe Metadaten {index}/{total_tracks}")
+            touch(job, progress=progress, message=f"Checking metadata {index}/{total_tracks}")
             metadata, confidence, status, message = identify_track(track.path, track.metadata)
             track.metadata = metadata
             track.confidence = confidence
             track.status = status
             track.message = message
 
-        touch(job, status="review", progress=91, message="Metadaten pruefen")
+        touch(job, status="review", progress=91, message="Review metadata")
     except Exception as exc:
         job.error = str(exc)
-        touch(job, status="failed", progress=0, message="Fehlgeschlagen")
+        touch(job, status="failed", progress=0, message="Failed")
 
 
 def finalize_job(job: Job) -> None:
@@ -846,12 +846,12 @@ def finalize_job(job: Job) -> None:
     work_dir = job_dir / "work"
     try:
         if not job.tracks:
-            raise RuntimeError("Keine Tracks zum Finalisieren gefunden.")
+            raise RuntimeError("No tracks were found to finalize.")
 
         total_tracks = len(job.tracks)
         for index, track in enumerate(job.tracks, start=1):
             progress = 93 + ((index - 1) / max(total_tracks, 1)) * 4
-            touch(job, status="finalizing", progress=progress, message=f"Schreibe Tags {index}/{total_tracks}")
+            touch(job, status="finalizing", progress=progress, message=f"Writing tags {index}/{total_tracks}")
             cover_path = cover_for_track(track, work_dir) if should_write_covers(job) else None
             if job.media_format == "mp3":
                 apply_mp3_metadata(track.path, track.metadata, cover_path)
@@ -860,10 +860,10 @@ def finalize_job(job: Job) -> None:
 
         files = [track.path for track in sorted(job.tracks, key=lambda item: item.position) if track.path.exists()]
         if not files:
-            raise RuntimeError("Keine Ausgabedateien zum Verpacken gefunden.")
+            raise RuntimeError("No output files were found to package.")
 
         job.download_name = safe_download_name(job, files)
-        touch(job, progress=98, message="Bereite Download vor")
+        touch(job, progress=98, message="Preparing download")
         if len(files) == 1 and not job.playlist_items:
             job.output_path = rename_output_file(files[0], job.download_name)
             job.tracks[0].path = job.output_path
@@ -872,10 +872,10 @@ def finalize_job(job: Job) -> None:
             build_zip(files, zip_path)
             job.output_path = zip_path
 
-        touch(job, status="done", progress=100, message="Fertig")
+        touch(job, status="done", progress=100, message="Ready")
     except Exception as exc:
         job.error = str(exc)
-        touch(job, status="failed", progress=0, message="Fehlgeschlagen")
+        touch(job, status="failed", progress=0, message="Failed")
 
 
 async def cleanup_loop() -> None:
@@ -901,7 +901,7 @@ async def probe(request: ProbeRequest) -> dict[str, Any]:
     except TimeoutError as exc:
         raise HTTPException(
             status_code=504,
-            detail="Link-Pruefung hat zu lange gedauert. Pruefe Internet/DNS auf dem Pi oder versuche es spaeter erneut.",
+            detail="Checking the link timed out. Check the Pi's internet and DNS connection, then try again.",
         ) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -928,7 +928,7 @@ async def create_job(request: JobRequest) -> dict[str, str]:
 async def get_job(job_id: str) -> dict[str, Any]:
     job = jobs.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job nicht gefunden oder bereits geloescht.")
+        raise HTTPException(status_code=404, detail="Job not found or already deleted.")
     return {
         "job_id": job.id,
         "status": job.status,
@@ -949,16 +949,16 @@ async def get_job(job_id: str) -> dict[str, Any]:
 async def finalize(job_id: str, request: FinalizeRequest) -> dict[str, str]:
     job = jobs.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job nicht gefunden oder bereits geloescht.")
+        raise HTTPException(status_code=404, detail="Job not found or already deleted.")
     if job.status != "review":
-        raise HTTPException(status_code=409, detail="Job ist nicht bereit fuer die Metadaten-Pruefung.")
+        raise HTTPException(status_code=409, detail="Job is not ready for metadata review.")
 
     submitted = {track.id: track.metadata for track in request.tracks}
     for track in job.tracks:
         if track.id in submitted:
             track.metadata = submitted[track.id]
 
-    touch(job, status="finalizing", progress=92, message="Finalisiere Download")
+    touch(job, status="finalizing", progress=92, message="Finalizing download")
     asyncio.create_task(asyncio.to_thread(finalize_job, job))
     return {"job_id": job.id}
 
@@ -994,7 +994,7 @@ async def get_history(session_id: str = "") -> dict[str, Any]:
 async def download_job(job_id: str) -> FileResponse:
     job = jobs.get(job_id)
     if not job or job.status != "done" or not job.output_path or not job.output_path.exists():
-        raise HTTPException(status_code=404, detail="Download nicht verfuegbar.")
+        raise HTTPException(status_code=404, detail="Download is unavailable.")
     return FileResponse(job.output_path, filename=job.download_name or job.output_path.name)
 
 

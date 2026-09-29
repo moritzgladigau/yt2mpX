@@ -52,13 +52,13 @@ const qualityPreferenceCookie = "yt2mpx-quality-preferences";
 
 const qualityOptions = {
   mp3: [
-    ["high", "Hoch (VBR 0)"],
-    ["medium", "Mittel (192 kbps)"],
-    ["small", "Klein (128 kbps)"],
-    ["minimal", "Minimal (32 kbps, kleinste Quelle)"],
+    ["high", "High (VBR 0)"],
+    ["medium", "Medium (192 kbps)"],
+    ["small", "Low (128 kbps)"],
+    ["minimal", "Minimal (32 kbps, smallest source)"],
   ],
   mp4: [
-    ["best_compatible", "Beste kompatible"],
+    ["best_compatible", "Best compatibility"],
     ["1080", "1080p"],
     ["720", "720p"],
     ["360", "360p"],
@@ -67,13 +67,13 @@ const qualityOptions = {
 
 const phaseLabels = {
   download: "Download",
-  convert: "Konvertierung",
+  convert: "Conversion",
   fingerprint: "Fingerprint",
   musicbrainz: "MusicBrainz",
-  review: "Review",
-  finalize: "Tagging/ZIP",
-  done: "Fertig",
-  queued: "Wartet",
+  review: "Metadata review",
+  finalize: "Preparing files",
+  done: "Ready",
+  queued: "Waiting",
 };
 
 const sessionIdKey = "yt2mpx-session-id";
@@ -151,9 +151,9 @@ function resetJobUi() {
   downloadSize.textContent = "";
   jobProgress.value = 0;
   jobPercent.textContent = "0%";
-  jobPhase.textContent = "Wartet";
-  jobMessage.textContent = "Wartet";
-  updateJobProgress({ status: "queued", progress: 0, message: "Wartet" });
+  jobPhase.textContent = "Waiting";
+  jobMessage.textContent = "Waiting";
+  updateJobProgress({ status: "queued", progress: 0, message: "Waiting" });
 }
 
 function formatBytes(bytes) {
@@ -170,9 +170,9 @@ function formatBytes(bytes) {
 }
 
 function formatRemaining(seconds) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "läuft gleich ab";
+  if (!Number.isFinite(seconds) || seconds <= 0) return "expires soon";
   const minutes = Math.max(1, Math.ceil(seconds / 60));
-  return minutes === 1 ? "noch 1 min" : `noch ${minutes} min`;
+  return minutes === 1 ? "1 min left" : `${minutes} min left`;
 }
 
 function updateDownloadSize(data) {
@@ -185,7 +185,7 @@ function updateDownloadSize(data) {
   }
 
   downloadSize.textContent = unpackedText
-    ? `Download: ${downloadText} ZIP, entpackt ca. ${unpackedText}`
+    ? `Download: ${downloadText} ZIP, about ${unpackedText} extracted`
     : `Download: ${downloadText}`;
   downloadSize.classList.remove("hidden");
 }
@@ -218,7 +218,7 @@ async function refreshHistory() {
   try {
     const response = await fetch(`/api/history?session_id=${encodeURIComponent(sessionId)}`);
     const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "History nicht verfügbar");
+    if (!response.ok) throw new Error(data.detail || "Download history is unavailable");
     renderHistory(data.items || []);
   } catch {
     historyCount.textContent = "!";
@@ -301,11 +301,11 @@ function syncCheckboxes() {
 function updatePlaylistSummary() {
   const total = playlistPositions().length;
   const selectedLongVideos = longVideoPositions().filter((position) => selectedPlaylistItems.has(position));
-  playlistSummary.textContent = `${selectedPlaylistItems.size} von ${total} Tracks ausgewählt`;
+  playlistSummary.textContent = `${selectedPlaylistItems.size} of ${total} tracks selected`;
   longVideoWarning.classList.toggle("hidden", selectedLongVideos.length === 0);
   longVideoMessage.textContent = selectedLongVideos.length === 1
-    ? "1 ausgewähltes Video ist länger als 10 Minuten."
-    : `${selectedLongVideos.length} ausgewählte Videos sind länger als 10 Minuten.`;
+    ? "1 selected video is longer than 10 minutes."
+    : `${selectedLongVideos.length} selected videos are longer than 10 minutes.`;
   startButton.disabled = total > 0 && selectedPlaylistItems.size === 0;
 }
 
@@ -353,7 +353,7 @@ async function postJson(url, payload) {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(data.detail || "Anfrage fehlgeschlagen");
+      throw new Error(data.detail || "Request failed");
     }
     return data;
   } finally {
@@ -369,7 +369,7 @@ function fillProbe(data) {
   thumbnail.src = data.thumbnail || "";
   mediaType.textContent = data.type === "playlist" ? "Playlist" : "Video";
   mediaTitle.textContent = data.title;
-  mediaCount.textContent = data.type === "playlist" ? `${data.count} Einträge` : "1 Eintrag";
+  mediaCount.textContent = data.type === "playlist" ? `${data.count} items` : "1 item";
 
   entries.replaceChildren();
   if (data.entries && data.entries.length > 0) {
@@ -401,7 +401,7 @@ function fillProbe(data) {
       position.textContent = `${item.position}.`;
       const title = document.createElement("span");
       title.className = "track-title";
-      title.textContent = item.title || "Unbenannter Eintrag";
+      title.textContent = item.title || "Untitled item";
       label.append(checkbox, position, title);
       if (isLongVideo) {
         const badge = document.createElement("span");
@@ -484,7 +484,7 @@ function renderReview(data) {
   const tracks = data.tracks || [];
   const matched = tracks.filter((track) => track.status === "matched").length;
   metadataReview.classList.remove("hidden");
-  reviewSummary.textContent = `${tracks.length} Track${tracks.length === 1 ? "" : "s"} bereit, ${matched} mit MusicBrainz-Treffer.`;
+  reviewSummary.textContent = `${tracks.length} track${tracks.length === 1 ? "" : "s"} ready; ${matched} matched in MusicBrainz.`;
   reviewList.replaceChildren();
 
   for (const track of tracks) {
@@ -496,11 +496,11 @@ function renderReview(data) {
     const head = document.createElement("div");
     head.className = "review-card-head";
     const title = document.createElement("strong");
-    title.textContent = `${track.position}. ${fieldValue(metadata, "title") || track.source_title || "Unbenannter Track"}`;
+    title.textContent = `${track.position}. ${fieldValue(metadata, "title") || track.source_title || "Untitled track"}`;
     const status = document.createElement("span");
     status.className = track.status === "matched" ? "match-pill matched" : "match-pill fallback";
     status.textContent = track.status === "matched"
-      ? `Gefunden ${Math.round((track.confidence || 0) * 100)}%`
+      ? `Matched ${Math.round((track.confidence || 0) * 100)}%`
       : "Fallback";
     head.append(title, status);
 
@@ -511,7 +511,7 @@ function renderReview(data) {
     const mainFields = document.createElement("div");
     mainFields.className = "review-fields";
     mainFields.append(
-      makeInput("title", "Titel", fieldValue(metadata, "title")),
+      makeInput("title", "Title", fieldValue(metadata, "title")),
       makeInput("artist", "Artist", fieldValue(metadata, "artist")),
       makeInput("album", "Album", fieldValue(metadata, "album")),
     );
@@ -519,11 +519,11 @@ function renderReview(data) {
     const details = document.createElement("details");
     details.className = "review-details";
     const summary = document.createElement("summary");
-    summary.textContent = "Weitere Tags";
+    summary.textContent = "More tags";
     const extraFields = document.createElement("div");
     extraFields.className = "review-fields extra";
     extraFields.append(
-      makeInput("date", "Datum/Jahr", fieldValue(metadata, "date")),
+      makeInput("date", "Date / year", fieldValue(metadata, "date")),
       makeInput("track_number", "Track", fieldValue(metadata, "track_number")),
       makeInput("disc_number", "Disc", fieldValue(metadata, "disc_number")),
       makeInput("isrc", "ISRC", fieldValue(metadata, "isrc")),
@@ -556,7 +556,7 @@ async function pollJob(jobId) {
   const response = await fetch(`/api/jobs/${jobId}`);
   const data = await response.json();
   if (!response.ok) {
-    throw new Error(data.detail || "Job nicht gefunden");
+    throw new Error(data.detail || "Job not found");
   }
 
   jobBox.classList.remove("hidden");
@@ -566,7 +566,7 @@ async function pollJob(jobId) {
     clearInterval(pollTimer);
     pollTimer = null;
     renderReview(data);
-    setNotice("Metadaten erkannt. Bitte prüfen und dann den Download vorbereiten.");
+    setNotice("Metadata is ready. Review it, then prepare your download.");
     startButton.disabled = false;
     metadataReview.scrollIntoView({ behavior: "smooth", block: "start" });
   }
@@ -579,7 +579,7 @@ async function pollJob(jobId) {
     downloadLink.download = data.download_name || "";
     downloadLink.classList.remove("hidden");
     updateDownloadSize(data);
-    setNotice(`Fertig. Der Download wird ${data.expires_after_minutes} Minuten bereitgehalten.`);
+    setNotice(`Ready. This download will remain available for ${data.expires_after_minutes} minutes.`);
     startButton.disabled = false;
     finalizeButton.disabled = false;
     refreshHistory();
@@ -588,7 +588,7 @@ async function pollJob(jobId) {
   if (data.status === "failed") {
     clearInterval(pollTimer);
     pollTimer = null;
-    setNotice(data.error || "Download fehlgeschlagen", true);
+    setNotice(data.error || "Download failed", true);
     startButton.disabled = false;
     finalizeButton.disabled = false;
   }
@@ -598,16 +598,16 @@ form.addEventListener("submit", async (event) => {
   event.preventDefault();
   result.classList.add("hidden");
   resetJobUi();
-  setNotice("Link wird geprüft...");
+  setNotice("Checking link...");
   probeButton.disabled = true;
   startButton.disabled = false;
   try {
     const data = await postJson("/api/probe", { url: urlInput.value.trim() });
     fillProbe(data);
-    setNotice(data.truncated ? "Playlist wurde auf die konfigurierte Maximalanzahl begrenzt." : "");
+    setNotice(data.truncated ? "The playlist was limited to the configured maximum number of items." : "");
   } catch (error) {
     const message = error.name === "AbortError"
-      ? "Anfrage hat zu lange gedauert. Der Pi/Container erreicht YouTube eventuell nicht."
+      ? "The request timed out. The Pi or container may be unable to reach YouTube."
       : error.message;
     setNotice(message, true);
   } finally {
@@ -618,7 +618,7 @@ form.addEventListener("submit", async (event) => {
 startButton.addEventListener("click", async () => {
   if (!currentProbe) return;
   resetJobUi();
-  setNotice("Metadaten-Prüfung wird gestartet...");
+  setNotice("Starting download and metadata lookup...");
   startButton.disabled = true;
   playlistDetails.open = false;
 
@@ -642,7 +642,7 @@ startButton.addEventListener("click", async () => {
     jobProgress.value = 0;
     jobPercent.textContent = "0%";
     jobPhase.textContent = "Download";
-    jobMessage.textContent = "Wartet auf Start";
+    jobMessage.textContent = "Waiting to start";
     setNotice("");
     pollTimer = setInterval(() => pollJob(currentJob).catch((error) => setNotice(error.message, true)), 1500);
     await pollJob(currentJob);
@@ -656,7 +656,7 @@ finalizeButton.addEventListener("click", async () => {
   if (!currentJob) return;
   finalizeButton.disabled = true;
   startButton.disabled = true;
-  setNotice("Tags werden geschrieben und Download wird vorbereitet...");
+  setNotice("Writing tags and preparing the download...");
   try {
     await postJson(`/api/jobs/${currentJob}/finalize`, { tracks: collectReviewTracks() });
     metadataReview.classList.add("hidden");
