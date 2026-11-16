@@ -15,10 +15,10 @@ docker compose up --build
 Open the app on your home network:
 
 ```text
-http://<pi-ip>:8000
+http://<pi-ip>:8765
 ```
 
-On the development machine, open `http://localhost:8000`.
+On the development machine, open `http://localhost:8765`.
 
 The Docker image includes Deno and yt-dlp's JavaScript challenge solver. If you run the Python app directly on macOS instead of with Docker, install the Python requirements and a supported JavaScript runtime such as Deno (`brew install deno`). Without both components, yt-dlp may report `Requested format is not available` even for a public video. See the [yt-dlp EJS setup guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS). Account-enabled jobs use YouTube's `web_safari` client, whose HLS streams can avoid HTTP 403 responses caused by missing GVS PO Tokens. Availability of those streams varies by account and video; see the [yt-dlp PO Token guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide).
 
