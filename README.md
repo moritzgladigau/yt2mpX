@@ -20,6 +20,8 @@ http://<pi-ip>:8000
 
 On the development machine, open `http://localhost:8000`.
 
+The Docker image includes Deno and yt-dlp's JavaScript challenge solver. If you run the Python app directly on macOS instead of with Docker, install the Python requirements and a supported JavaScript runtime such as Deno (`brew install deno`). Without both components, yt-dlp may report `Requested format is not available` even for a public video. See the [yt-dlp EJS setup guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS). Account-enabled jobs use YouTube's `web_safari` client, whose HLS streams can avoid HTTP 403 responses caused by missing GVS PO Tokens. Availability of those streams varies by account and video; see the [yt-dlp PO Token guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide).
+
 ## How it works
 
 1. Check a video or playlist URL. Choose the format, quality, and playlist items.
@@ -40,6 +42,7 @@ The main settings are in `docker-compose.yml`. You can add other environment var
 - `YTMPX_MAX_PLAYLIST_ITEMS`: Maximum number of playlist items per job (100 in Docker Compose).
 - `YTMPX_PROBE_TIMEOUT_SECONDS`: Link check timeout (default: 75 seconds; not set in Docker Compose).
 - `YTMPX_YTDLP_SOCKET_TIMEOUT_SECONDS`: yt-dlp network timeout (default: 30 seconds; not set in Docker Compose).
+- `YTMPX_YOUTUBE_COOKIES_FILE`: Path to an optional Netscape-format YouTube cookie file inside the container (`/run/yt2mpx-secrets/youtube-cookies.txt` in Docker Compose).
 - `YTMPX_ACOUSTID_API_KEY`: AcoustID Application API Key for audio fingerprint matching. The app still works without it, using fallback metadata.
 - `YTMPX_MUSICBRAINZ_USER_AGENT`: MusicBrainz user agent, ideally with contact information.
 - `./downloads:/data`: Local storage for temporary job files. Completed jobs are stored under `./downloads/jobs/<job_id>/`.
@@ -56,6 +59,16 @@ MusicBrainz does not require an API key for metadata lookups. Set `YTMPX_MUSICBR
 
 Keep `.env` private; only `.env.example`, which contains no credentials, belongs in Git.
 
+## Private and age-restricted YouTube content
+
+If your YouTube account has access to the content, you can opt in to using its cookies for a link. Create `secrets/` next to `docker-compose.yml` and place a Netscape-format export of **youtube.com cookies only** at `secrets/youtube-cookies.txt`. Restrict access to the file (for example, `chmod 600 secrets/youtube-cookies.txt` on the Pi). The `secrets/` directory is ignored by Git and mounted read-only in the container. Keep the file private; it grants access to your account session. Start or restart Docker Compose, then select **Use YouTube account for this link** before checking the link. The same setting is used for the download. Without a cookie file, the switch is hidden and public downloads continue to work anonymously.
+
+Follow the [yt-dlp YouTube cookie export instructions](https://github.com/yt-dlp/yt-dlp-wiki/blob/master/Extractors.md#exporting-youtube-cookies): sign in in a fresh private/incognito window, navigate to `https://www.youtube.com/robots.txt` in that tab, export only the YouTube cookies in Netscape `cookies.txt` format, then close the private window. Do not use yt-dlp's combined `--cookies-from-browser` and `--cookies` command for this private session. The file must start with `# Netscape HTTP Cookie File` or `# HTTP Cookie File`. Use Unix (LF) line endings on the Pi.
+
+To renew an expired session, replace `secrets/youtube-cookies.txt` with a fresh export. New link checks and jobs read the current file; no container rebuild is needed. If the switch is missing, check that the file exists and is readable inside the container. If yt-dlp reports an authentication error, export fresh cookies and confirm the account can open that content in YouTube. Cookies do not solve every YouTube restriction; [some formats or features may require a PO Token](https://github.com/yt-dlp/yt-dlp-wiki/blob/master/Extractors.md#youtube).
+
+The app has no login: anyone who can use it on your home network can select the account switch. Use a dedicated account if appropriate, and limit access to the Pi. yt-dlp also warns that using an account can cause temporary or permanent account restrictions if requests are excessive.
+
 ## Quality options
 
 - MP3 **High**: high VBR quality (`VBR 0`).
@@ -69,5 +82,6 @@ MP3 quality and the cover-art option are saved in a browser session cookie. The 
 
 ## Notes
 
-- Private or age-restricted content may need cookie support, which is not implemented yet.
+- Private or age-restricted content requires an account that can access it and a working YouTube cookie file.
 - Version 1 has no login. Run it only on a trusted home network.
+- Future idea (not implemented): give each yt2mpX user a separate account and a supported way to authorize their own YouTube access without managing a shared cookie file. This depends on a reliable YouTube authentication method for yt-dlp; the current implementation still uses cookies.

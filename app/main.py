@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -11,8 +12,10 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from http.cookiejar import LoadError, MozillaCookieJar
 from pathlib import Path
 from typing import Any, Literal
 
@@ -35,6 +38,7 @@ MAX_PLAYLIST_ITEMS = int(os.getenv("YTMPX_MAX_PLAYLIST_ITEMS", "100"))
 JOB_TTL_MINUTES = int(os.getenv("YTMPX_JOB_TTL_MINUTES", str(int(os.getenv("YTMPX_JOB_TTL_HOURS", "2")) * 60)))
 PROBE_TIMEOUT_SECONDS = int(os.getenv("YTMPX_PROBE_TIMEOUT_SECONDS", "75"))
 YTDLP_SOCKET_TIMEOUT_SECONDS = int(os.getenv("YTMPX_YTDLP_SOCKET_TIMEOUT_SECONDS", "30"))
+YOUTUBE_COOKIES_FILE = Path(os.getenv("YTMPX_YOUTUBE_COOKIES_FILE", "/run/yt2mpx-secrets/youtube-cookies.txt"))
 ACOUSTID_API_KEY = os.getenv("YTMPX_ACOUSTID_API_KEY") or os.getenv("ACOUSTID_API_KEY") or ""
 ACOUSTID_MIN_SCORE = float(os.getenv("YTMPX_ACOUSTID_MIN_SCORE", "0.78"))
 METADATA_LOOKUP_TIMEOUT_SECONDS = int(os.getenv("YTMPX_METADATA_LOOKUP_TIMEOUT_SECONDS", "20"))
@@ -47,6 +51,7 @@ last_musicbrainz_request_at = 0.0
 
 class ProbeRequest(BaseModel):
     url: str = Field(min_length=1)
+    use_youtube_cookies: bool = False
 
 
 class Metadata(BaseModel):
@@ -71,6 +76,7 @@ class JobRequest(BaseModel):
     audio_quality: Literal["high", "medium", "small", "minimal"] = "medium"
     embed_cover: bool = True
     video_quality: Literal["360", "720", "1080", "best_compatible"] = "best_compatible"
+    use_youtube_cookies: bool = False
 
 
 class FinalizeTrack(BaseModel):
@@ -106,6 +112,7 @@ class Job:
     audio_quality: str = "medium"
     embed_cover: bool = True
     video_quality: str = "best_compatible"
+    use_youtube_cookies: bool = False
     status: str = "queued"
     progress: float = 0
     message: str = "Waiting to start"
@@ -123,6 +130,53 @@ app = FastAPI(title="yt2mpX", version="1.0.0")
 jobs: dict[str, Job] = {}
 
 
+def youtube_cookies_available() -> bool:
+    return YOUTUBE_COOKIES_FILE.is_file() and os.access(YOUTUBE_COOKIES_FILE, os.R_OK)
+
+
+def validate_youtube_cookies(path: Path | None = None) -> None:
+    cookie_path = path or YOUTUBE_COOKIES_FILE
+    if not cookie_path.is_file() or not os.access(cookie_path, os.R_OK):
+        raise ValueError("YouTube cookie file is missing or unreadable. Add secrets/youtube-cookies.txt on the Pi.")
+    try:
+        with cookie_path.open("rb") as cookie_file:
+            header = cookie_file.readline().rstrip(b"\r\n")
+        if header not in {b"# Netscape HTTP Cookie File", b"# HTTP Cookie File"}:
+            raise ValueError("YouTube cookie file must use Netscape cookies.txt format.")
+        jar = MozillaCookieJar(str(cookie_path))
+        jar.load(ignore_discard=True)
+        domains = [cookie.domain.lstrip(".").lower() for cookie in jar]
+        if not any(domain == "youtube.com" or domain.endswith(".youtube.com") for domain in domains):
+            raise ValueError("YouTube cookie file contains no valid youtube.com cookies.")
+        if any(domain != "youtube.com" and not domain.endswith(".youtube.com") for domain in domains):
+            raise ValueError("YouTube cookie file must contain only youtube.com cookies.")
+    except (OSError, LoadError, UnicodeError) as exc:
+        raise ValueError("YouTube cookie file is unreadable or invalid. Export a fresh Netscape cookies.txt file.") from exc
+
+
+@contextmanager
+def yt_dlp_cookie_options(use_youtube_cookies: bool):
+    if not use_youtube_cookies:
+        yield {}
+        return
+    if not youtube_cookies_available():
+        raise ValueError("YouTube cookie file is missing or unreadable. Add secrets/youtube-cookies.txt on the Pi.")
+    fd, path = tempfile.mkstemp(prefix="yt2mpx-cookies-", suffix=".txt")
+    try:
+        try:
+            with os.fdopen(fd, "wb") as target, YOUTUBE_COOKIES_FILE.open("rb") as source:
+                shutil.copyfileobj(source, target)
+        except OSError as exc:
+            raise ValueError("YouTube cookie file is missing or unreadable. Add secrets/youtube-cookies.txt on the Pi.") from exc
+        validate_youtube_cookies(Path(path))
+        yield {
+            "cookiefile": path,
+            "extractor_args": {"youtube": {"player_client": ["web_safari"]}},
+        }
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
 def touch(job: Job, *, status: str | None = None, progress: float | None = None, message: str | None = None) -> None:
     if status is not None:
         job.status = status
@@ -133,7 +187,7 @@ def touch(job: Job, *, status: str | None = None, progress: float | None = None,
     job.updated_at = datetime.now(timezone.utc)
 
 
-def run_probe(url: str) -> dict[str, Any]:
+def run_probe(url: str, use_youtube_cookies: bool = False) -> dict[str, Any]:
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -141,8 +195,9 @@ def run_probe(url: str) -> dict[str, Any]:
         "playlistend": MAX_PLAYLIST_ITEMS,
         "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
     }
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    with yt_dlp_cookie_options(use_youtube_cookies) as cookie_options:
+        with YoutubeDL({**opts, **cookie_options}) as ydl:
+            info = ydl.extract_info(url, download=False)
 
     entries = info.get("entries") or []
     is_playlist = bool(entries)
@@ -507,6 +562,15 @@ def mp4_format_selector(quality: str) -> str:
     )
 
 
+def account_hls_format_selector(media_format: str, quality: str) -> str:
+    if media_format == "mp3":
+        if quality == "minimal":
+            return "worstaudio[protocol=m3u8_native]/worst[protocol=m3u8_native]/worstaudio/worst"
+        return "bestaudio[protocol=m3u8_native]/best[protocol=m3u8_native][height<=360]/best[protocol=m3u8_native]/bestaudio/best"
+    height_filter = f"[height<={quality}]" if quality in {"360", "720", "1080"} else ""
+    return f"best[protocol=m3u8_native][vcodec^=avc1][ext=mp4]{height_filter}/{mp4_format_selector(quality)}"
+
+
 def ydl_options(job: Job, work_dir: Path) -> dict[str, Any]:
     is_playlist_selection = bool(job.playlist_items)
     is_minimal_audio = job.media_format == "mp3" and is_minimal_audio_quality(job.audio_quality)
@@ -543,7 +607,11 @@ def ydl_options(job: Job, work_dir: Path) -> dict[str, Any]:
                 postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
         common.update(
             {
-                "format": "worstaudio/worst" if is_minimal_audio else "bestaudio/best",
+                "format": (
+                    account_hls_format_selector("mp3", job.audio_quality)
+                    if job.use_youtube_cookies
+                    else "worstaudio/worst" if is_minimal_audio else "bestaudio/best"
+                ),
                 "postprocessors": postprocessors,
             }
         )
@@ -558,7 +626,7 @@ def ydl_options(job: Job, work_dir: Path) -> dict[str, Any]:
             )
         common.update(
             {
-                "format": mp4_format_selector(job.video_quality),
+                "format": account_hls_format_selector("mp4", job.video_quality) if job.use_youtube_cookies else mp4_format_selector(job.video_quality),
                 "merge_output_format": "mp4",
             }
         )
@@ -812,10 +880,11 @@ def run_job(job: Job) -> None:
 
     try:
         touch(job, status="running", progress=1, message="Checking link")
-        with YoutubeDL(ydl_options(job, work_dir)) as ydl:
-            info = ydl.extract_info(job.url, download=True)
-            job.is_playlist = bool(info.get("entries"))
-            job.collection_title = first_text(info.get("title"), "yt2mpX-download")
+        with yt_dlp_cookie_options(job.use_youtube_cookies) as cookie_options:
+            with YoutubeDL({**ydl_options(job, work_dir), **cookie_options}) as ydl:
+                info = ydl.extract_info(job.url, download=True)
+                job.is_playlist = bool(info.get("entries"))
+                job.collection_title = first_text(info.get("title"), "yt2mpX-download")
 
         files = media_files(work_dir, job.media_format)
         if not files:
@@ -897,18 +966,30 @@ async def startup() -> None:
 @app.post("/api/probe")
 async def probe(request: ProbeRequest) -> dict[str, Any]:
     try:
-        return await asyncio.wait_for(asyncio.to_thread(run_probe, request.url), timeout=PROBE_TIMEOUT_SECONDS)
+        return await asyncio.wait_for(asyncio.to_thread(run_probe, request.url, request.use_youtube_cookies), timeout=PROBE_TIMEOUT_SECONDS)
     except TimeoutError as exc:
         raise HTTPException(
             status_code=504,
             detail="Checking the link timed out. Check the Pi's internet and DNS connection, then try again.",
         ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/config")
+async def get_config() -> dict[str, bool]:
+    return {"youtube_cookies_available": youtube_cookies_available()}
+
+
 @app.post("/api/jobs")
 async def create_job(request: JobRequest) -> dict[str, str]:
+    if request.use_youtube_cookies:
+        try:
+            validate_youtube_cookies()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     job = Job(
         id=uuid.uuid4().hex,
         url=request.url,
@@ -918,6 +999,7 @@ async def create_job(request: JobRequest) -> dict[str, str]:
         audio_quality=request.audio_quality,
         embed_cover=request.embed_cover,
         video_quality=request.video_quality,
+        use_youtube_cookies=request.use_youtube_cookies,
     )
     jobs[job.id] = job
     asyncio.create_task(asyncio.to_thread(run_job, job))

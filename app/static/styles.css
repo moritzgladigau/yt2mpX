@@ -427,6 +427,10 @@ button:disabled {
   padding: 0;
 }
 
+#youtube-account-toggle {
+  margin-top: 12px;
+}
+
 .playlist summary {
   cursor: pointer;
   color: var(--ink);

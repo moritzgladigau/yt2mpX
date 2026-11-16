@@ -1,4 +1,6 @@
 const form = document.querySelector("#probe-form");
+const youtubeAccountToggle = document.querySelector("#youtube-account-toggle");
+const useYoutubeCookiesInput = document.querySelector("#use-youtube-cookies");
 const urlInput = document.querySelector("#url");
 const notice = document.querySelector("#notice");
 const result = document.querySelector("#result");
@@ -41,6 +43,8 @@ const historyList = document.querySelector("#history-list");
 const qualitySelect = document.querySelector("#quality-select");
 
 let currentProbe = null;
+let currentProbeUseYoutubeCookies = false;
+let currentProbeUrl = "";
 let currentJob = null;
 let pollTimer = null;
 let selectedPlaylistItems = new Set();
@@ -361,8 +365,10 @@ async function postJson(url, payload) {
   }
 }
 
-function fillProbe(data) {
+function fillProbe(data, probeUrl, useYoutubeCookies) {
   currentProbe = data;
+  currentProbeUrl = probeUrl;
+  currentProbeUseYoutubeCookies = useYoutubeCookies;
   result.classList.remove("hidden");
   resetJobUi();
 
@@ -600,10 +606,16 @@ form.addEventListener("submit", async (event) => {
   resetJobUi();
   setNotice("Checking link...");
   probeButton.disabled = true;
+  useYoutubeCookiesInput.disabled = true;
   startButton.disabled = false;
+  const probeUrl = urlInput.value.trim();
+  const useYoutubeCookies = useYoutubeCookiesInput.checked;
   try {
-    const data = await postJson("/api/probe", { url: urlInput.value.trim() });
-    fillProbe(data);
+    const data = await postJson("/api/probe", {
+      url: probeUrl,
+      use_youtube_cookies: useYoutubeCookies,
+    });
+    fillProbe(data, probeUrl, useYoutubeCookies);
     setNotice(data.truncated ? "The playlist was limited to the configured maximum number of items." : "");
   } catch (error) {
     const message = error.name === "AbortError"
@@ -612,6 +624,7 @@ form.addEventListener("submit", async (event) => {
     setNotice(message, true);
   } finally {
     probeButton.disabled = false;
+    useYoutubeCookiesInput.disabled = false;
   }
 });
 
@@ -624,8 +637,9 @@ startButton.addEventListener("click", async () => {
 
   const format = currentFormat();
   const payload = {
-    url: urlInput.value.trim(),
+    url: currentProbeUrl,
     format,
+    use_youtube_cookies: currentProbeUseYoutubeCookies,
     audio_quality: selectedAudioQuality,
     embed_cover: embedCover,
     video_quality: selectedVideoQuality,
@@ -651,6 +665,31 @@ startButton.addEventListener("click", async () => {
     startButton.disabled = false;
   }
 });
+
+async function refreshYoutubeAccountAvailability() {
+  try {
+    const response = await fetch("/api/config");
+    if (!response.ok) return;
+    const config = await response.json();
+    const available = config.youtube_cookies_available === true;
+    youtubeAccountToggle.classList.toggle("hidden", !available);
+    if (!available) useYoutubeCookiesInput.checked = false;
+  } catch {
+    youtubeAccountToggle.classList.add("hidden");
+    useYoutubeCookiesInput.checked = false;
+  }
+}
+
+useYoutubeCookiesInput.addEventListener("change", () => {
+  currentProbe = null;
+  currentProbeUseYoutubeCookies = false;
+  currentProbeUrl = "";
+  result.classList.add("hidden");
+  resetJobUi();
+  setNotice("Check the link to use this account setting.");
+});
+
+refreshYoutubeAccountAvailability();
 
 finalizeButton.addEventListener("click", async () => {
   if (!currentJob) return;
