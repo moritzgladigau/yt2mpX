@@ -38,6 +38,23 @@ class LivePipelineTests(unittest.TestCase):
         self.assertEqual(len(job.tracks), 1)
         self.assertEqual(job.tracks[0].source_title, "Song")
 
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required")
+    def test_yt_dlp_hook_waits_for_mp3_conversion(self):
+        work_dir = self.root / "convert"
+        work_dir.mkdir()
+        source = work_dir / "Song.m4a"
+        subprocess.run([
+            "ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+            "-t", "0.2", "-y", str(source),
+        ], check=True, capture_output=True)
+        job = main.Job("convert", "url", "mp3", "session")
+        with main.YoutubeDL(main.ydl_options(job, work_dir)) as ydl:
+            ydl.add_post_processor(main.ReadyTrackPostProcessor(ydl, job, work_dir), when="after_move")
+            ydl.post_process(str(source), {"id": "local", "title": "Song", "artist": "Artist", "ext": "m4a", "acodec": "mp4a.40.2", "vcodec": "none"})
+        self.assertEqual(len(job.tracks), 1)
+        self.assertEqual(job.tracks[0].path.suffix, ".mp3")
+        self.assertTrue(job.tracks[0].path.exists())
+
     def test_first_track_is_tagged_while_next_download_waits(self):
         first_tagged = threading.Event()
         first_was_visible_during_download = []
