@@ -122,17 +122,19 @@
 
         <section id="metadata-review" class="metadata-review hidden">
           <div class="review-head">
-            <h2>Review metadata</h2>
+            <h2>Tracks and metadata</h2>
             <p id="review-summary"></p>
+          </div>
+          <div class="review-column-head" aria-hidden="true">
+            <span></span><span>Title</span><span>Artist</span><span>Album</span><span>Status</span>
           </div>
           <div id="review-list" class="review-list"></div>
           <div class="review-actions">
-            <button id="accept-all-button" type="button">Accept all found matches</button>
-            <button id="finalize-button" class="primary" type="button">Apply tags and prepare download</button>
+            <button id="finalize-button" class="primary" type="button" disabled>Prepare download</button>
           </div>
         </section>
       </section>
     </main>
-    <script src="/app.js?v=20261116-musicbrainz-passes"></script>
+    <script src="/app.js?v=20261119-live-tracks"></script>
   </body>
 </html>

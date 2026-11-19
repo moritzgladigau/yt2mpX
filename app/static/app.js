@@ -32,7 +32,6 @@ const metadataReview = document.querySelector("#metadata-review");
 const reviewSummary = document.querySelector("#review-summary");
 const reviewList = document.querySelector("#review-list");
 const finalizeButton = document.querySelector("#finalize-button");
-const acceptAllButton = document.querySelector("#accept-all-button");
 const coverToggle = document.querySelector("#cover-toggle");
 const coverInput = document.querySelector("#minimal-cover");
 const historyToggle = document.querySelector("#history-toggle");
@@ -48,6 +47,11 @@ let currentProbeUseYoutubeCookies = false;
 let currentProbeUrl = "";
 let currentJob = null;
 let pollTimer = null;
+let openEditorId = null;
+let latestTracks = new Map();
+let lastJobData = null;
+let pollSequence = 0;
+let latestAppliedPoll = 0;
 let selectedPlaylistItems = new Set();
 let selectedAudioQuality = "medium";
 let selectedVideoQuality = "best_compatible";
@@ -148,8 +152,11 @@ function resetJobUi() {
   metadataReview.classList.add("hidden");
   reviewList.replaceChildren();
   reviewSummary.textContent = "";
+  latestTracks = new Map();
+  openEditorId = null;
+  lastJobData = null;
+  latestAppliedPoll = ++pollSequence;
   finalizeButton.disabled = false;
-  acceptAllButton.disabled = false;
   downloadLink.classList.add("hidden");
   downloadLink.removeAttribute("href");
   downloadLink.removeAttribute("download");
@@ -347,12 +354,12 @@ function syncCoverToggle() {
   coverInput.checked = embedCover;
 }
 
-async function postJson(url, payload) {
+async function postJson(url, payload, method = "POST") {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 90000);
   try {
     const response = await fetch(url, {
-      method: "POST",
+      method,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       signal: controller.signal,
@@ -488,147 +495,212 @@ function makeInput(field, label, value, type = "text") {
   return wrapper;
 }
 
-function renderReview(data) {
-  const tracks = data.tracks || [];
-  metadataReview.classList.remove("hidden");
+const trackPhaseLabels = {
+  queued: "Waiting",
+  fingerprint: "Fingerprint",
+  acoustid: "AcoustID",
+  musicbrainz: "MusicBrainz",
+  retrying: "Retry planned",
+  tags_queued: "Tags queued",
+  tagging: "Writing metadata",
+  ready: "Ready",
+  tag_error: "Tagging failed",
+};
 
-  for (const track of tracks) {
-    if (reviewList.querySelector(`[data-track-id="${track.id}"]`)) continue;
-    const metadata = track.metadata || {};
-    const article = document.createElement("article");
-    article.className = "review-card";
-    article.dataset.trackId = track.id;
+function setCover(img, primary, fallback) {
+  const requested = primary || fallback || "";
+  if (img.dataset.requested === requested) return;
+  img.dataset.requested = requested;
+  img.hidden = !requested;
+  img.onerror = () => {
+    if (fallback && img.src !== fallback) img.src = fallback;
+    else img.hidden = true;
+  };
+  if (requested) img.src = requested;
+}
 
-    const head = document.createElement("div");
-    head.className = "review-card-head";
-    const title = document.createElement("strong");
-    title.textContent = `${track.position}. ${fieldValue(metadata, "title") || track.source_title || "Untitled track"}`;
-    const status = document.createElement("span");
-    status.className = "match-pill fallback";
-    head.append(title, status);
-
-    const source = document.createElement("p");
-    source.className = "review-source";
-    source.textContent = track.message || track.source_title || track.file_name || "";
-
-    const mainFields = document.createElement("div");
-    mainFields.className = "review-fields";
-    mainFields.append(
-      makeInput("title", "Title", fieldValue(metadata, "title")),
-      makeInput("artist", "Artist", fieldValue(metadata, "artist")),
-      makeInput("album", "Album", fieldValue(metadata, "album")),
-    );
-
-    const details = document.createElement("details");
-    details.className = "review-details";
-    const summary = document.createElement("summary");
-    summary.textContent = "More tags";
-    const extraFields = document.createElement("div");
-    extraFields.className = "review-fields extra";
-    extraFields.append(
-      makeInput("date", "Date / year", fieldValue(metadata, "date")),
-      makeInput("track_number", "Track", fieldValue(metadata, "track_number")),
-      makeInput("disc_number", "Disc", fieldValue(metadata, "disc_number")),
-      makeInput("isrc", "ISRC", fieldValue(metadata, "isrc")),
-      makeInput("cover_url", "Cover URL", fieldValue(metadata, "cover_url"), "url"),
-      makeInput("musicbrainz_recording_id", "MB Recording ID", fieldValue(metadata, "musicbrainz_recording_id")),
-      makeInput("musicbrainz_release_id", "MB Release ID", fieldValue(metadata, "musicbrainz_release_id")),
-      makeInput("musicbrainz_release_group_id", "MB Release Group ID", fieldValue(metadata, "musicbrainz_release_group_id")),
-    );
-    details.append(summary, extraFields);
-
-    const suggestion = document.createElement("div");
-    suggestion.className = "review-suggestion";
-    const suggestionText = document.createElement("span");
-    const accept = document.createElement("button");
-    accept.type = "button";
-    accept.textContent = "Accept";
-    accept.addEventListener("click", () => decideMatch("accept", track.id));
-    const reject = document.createElement("button");
-    reject.type = "button";
-    reject.textContent = "Reject";
-    reject.addEventListener("click", () => decideMatch("reject", track.id));
-    suggestion.append(suggestionText, accept, reject);
-    article.append(head, source, suggestion, mainFields, details);
-    reviewList.appendChild(article);
+function editorMetadata(card) {
+  const metadata = {};
+  for (const input of card.querySelectorAll("input[data-field]")) {
+    metadata[input.dataset.field] = input.value.trim();
   }
+  return metadata;
+}
+
+function closeEditor() {
+  if (openEditorId) {
+    const card = reviewList.querySelector(`[data-track-id="${openEditorId}"]`);
+    card?.querySelector(".review-editor")?.classList.add("hidden");
+  }
+  openEditorId = null;
+  finalizeButton.disabled = lastJobData?.status !== "review";
+}
+
+function toggleEditor(trackId) {
+  if (openEditorId === trackId) {
+    closeEditor();
+    return;
+  }
+  closeEditor();
+  const card = reviewList.querySelector(`[data-track-id="${trackId}"]`);
+  const track = latestTracks.get(trackId);
+  if (!card || !track || lastJobData?.status !== "review") return;
+  for (const input of card.querySelectorAll("input[data-field]")) {
+    input.value = fieldValue(track.metadata, input.dataset.field);
+  }
+  card.querySelector(".review-editor").classList.remove("hidden");
+  openEditorId = trackId;
+  finalizeButton.disabled = true;
+}
+
+function makeReviewCard(track) {
+  const card = document.createElement("article");
+  card.className = "review-card";
+  card.dataset.trackId = track.id;
+  card.dataset.position = track.position;
+  const row = document.createElement("div");
+  row.className = "review-row";
+  const cover = document.createElement("img");
+  cover.className = "review-cover";
+  cover.alt = "";
+  cover.loading = "lazy";
+  const coverFrame = document.createElement("div");
+  coverFrame.className = "review-cover-frame";
+  coverFrame.appendChild(cover);
+  const text = document.createElement("div");
+  text.className = "review-text";
+  const current = document.createElement("div");
+  current.className = "review-data review-current";
+  const source = document.createElement("div");
+  source.className = "review-data review-youtube";
+  for (let i = 0; i < 3; i += 1) {
+    current.appendChild(document.createElement("span"));
+    source.appendChild(document.createElement("span"));
+  }
+  text.append(current, source);
+  const actions = document.createElement("div");
+  actions.className = "review-status";
+  const spinner = document.createElement("span");
+  spinner.className = "review-spinner hidden";
+  spinner.setAttribute("aria-hidden", "true");
+  const status = document.createElement("span");
+  status.className = "match-pill fallback";
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.className = "review-edit hidden";
+  edit.textContent = "✎";
+  edit.title = "Edit metadata";
+  edit.setAttribute("aria-label", "Edit metadata");
+  edit.addEventListener("click", () => toggleEditor(track.id));
+  actions.append(spinner, status, edit);
+  row.append(coverFrame, text, actions);
+
+  const editor = document.createElement("div");
+  editor.className = "review-editor hidden";
+  const fields = document.createElement("div");
+  fields.className = "review-fields";
+  fields.append(
+    makeInput("title", "Title", ""),
+    makeInput("artist", "Artist", ""),
+    makeInput("album", "Album", ""),
+    makeInput("date", "Date / year", ""),
+    makeInput("track_number", "Track", ""),
+    makeInput("disc_number", "Disc", ""),
+    makeInput("isrc", "ISRC", ""),
+    makeInput("cover_url", "Cover URL", "", "url"),
+    makeInput("musicbrainz_recording_id", "MB Recording ID", ""),
+    makeInput("musicbrainz_release_id", "MB Release ID", ""),
+    makeInput("musicbrainz_release_group_id", "MB Release Group ID", ""),
+  );
+  const save = document.createElement("button");
+  save.type = "button";
+  save.textContent = "Save this track";
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      const result = await postJson(`/api/jobs/${currentJob}/tracks/${track.id}`, { metadata: editorMetadata(card) }, "PATCH");
+      latestTracks.set(track.id, result.track);
+      lastJobData.tracks = lastJobData.tracks.map((item) => item.id === track.id ? result.track : item);
+      closeEditor();
+      syncReview(lastJobData);
+    } catch (error) {
+      setNotice(error.message, true);
+    } finally {
+      save.disabled = false;
+    }
+  });
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", closeEditor);
+  const editorActions = document.createElement("div");
+  editorActions.className = "review-editor-actions";
+  editorActions.append(save, cancel);
+  editor.append(fields, editorActions);
+  card.append(row, editor);
+  return card;
+}
+
+function syncReview(data) {
+  const tracks = (data.tracks || []).map((track) => {
+    const previous = latestTracks.get(track.id);
+    return previous && previous.metadata_revision > track.metadata_revision ? previous : track;
+  });
+  const expected = data.expected_tracks || tracks.length;
+  const ready = tracks.filter((track) => track.tag_status === "written").length;
+  reviewSummary.textContent = `${tracks.length}/${expected} files converted · ${ready} tagged${data.status === "review" ? " · Ready to review" : " · Processing continues"}`;
+  finalizeButton.disabled = data.status !== "review" || Boolean(openEditorId);
+  for (const track of tracks) {
+    latestTracks.set(track.id, track);
+    const card = reviewList.querySelector(`[data-track-id="${track.id}"]`);
+    if (!card) continue;
+    const metadata = track.metadata || {};
+    const current = card.querySelector(".review-current").children;
+    const source = card.querySelector(".review-youtube").children;
+    [metadata.title, metadata.artist, metadata.album].forEach((value, i) => { current[i].textContent = value || "—"; });
+    [track.source_title, track.source_artist, track.source_album].forEach((value, i) => { source[i].textContent = value || "—"; });
+    setCover(card.querySelector(".review-cover"), metadata.cover_url, track.source_cover_url);
+    const status = card.querySelector(".match-pill");
+    status.textContent = trackPhaseLabels[track.phase] || track.phase || "Waiting";
+    status.title = track.tag_error || track.message || "";
+    status.className = `match-pill ${track.phase === "ready" ? "matched" : "fallback"}`;
+    card.querySelector(".review-spinner").classList.toggle("hidden", !["fingerprint", "acoustid", "musicbrainz", "retrying", "tagging", "tags_queued"].includes(track.phase));
+    card.querySelector(".review-edit").classList.toggle("hidden", data.status !== "review");
+  }
+}
+
+function renderReview(data) {
+  metadataReview.classList.remove("hidden");
+  let added = false;
+  for (const track of data.tracks || []) {
+    if (!reviewList.querySelector(`[data-track-id="${track.id}"]`)) {
+      reviewList.appendChild(makeReviewCard(track));
+      added = true;
+    }
+  }
+  if (added) [...reviewList.children].sort((a, b) => Number(a.dataset.position) - Number(b.dataset.position)).forEach((card) => reviewList.appendChild(card));
   syncReview(data);
 }
 
-function syncReview(data, newlyAccepted = new Set()) {
-  const tracks = data.tracks || [];
-  const found = tracks.filter((track) => track.lookup_status === "suggested").length;
-  const accepted = tracks.filter((track) => track.lookup_status === "accepted").length;
-  reviewSummary.textContent = `${tracks.length} tracks ready; ${found} suggestions, ${accepted} accepted.${data.lookup_active ? " Search continues in the background." : " Search finished."}`;
-  acceptAllButton.disabled = found === 0;
-  for (const track of tracks) {
-    const card = reviewList.querySelector(`[data-track-id="${track.id}"]`);
-    if (!card) continue;
-    const status = card.querySelector(".match-pill");
-    const source = card.querySelector(".review-source");
-    const suggestion = card.querySelector(".review-suggestion");
-    const suggestionText = suggestion.querySelector("span");
-    const canDecide = track.lookup_status === "suggested";
-    status.textContent = track.lookup_status.replaceAll("_", " ");
-    status.className = `match-pill ${canDecide || track.lookup_status === "accepted" ? "matched" : "fallback"}`;
-    source.textContent = track.message || track.source_title || track.file_name || "";
-    suggestionText.textContent = canDecide
-      ? `${track.suggested_metadata?.title || ""} — ${track.suggested_metadata?.artist || ""} (${Math.round((track.confidence || 0) * 100)}%)`
-      : "";
-    suggestion.classList.toggle("hidden", !canDecide);
-    if (newlyAccepted.has(track.id)) {
-      for (const input of card.querySelectorAll("input[data-field]")) {
-        input.value = fieldValue(track.metadata, input.dataset.field);
-      }
-    }
-    card.dataset.accepted = track.lookup_status === "accepted" ? "true" : "false";
-  }
-}
-
-async function decideMatch(action, trackId = "") {
-  if (!currentJob) return;
-  try {
-    const previouslyAccepted = new Set([...reviewList.querySelectorAll('.review-card[data-accepted="true"]')].map((card) => card.dataset.trackId));
-    const data = await postJson(`/api/jobs/${currentJob}/matches`, { action, track_id: trackId });
-    const newlyAccepted = new Set(data.tracks.filter((track) => track.lookup_status === "accepted" && !previouslyAccepted.has(track.id)).map((track) => track.id));
-    syncReview(data, newlyAccepted);
-  } catch (error) {
-    setNotice(error.message, true);
-  }
-}
-
-function collectReviewTracks() {
-  return [...reviewList.querySelectorAll(".review-card")].map((card) => {
-    const metadata = {};
-    for (const input of card.querySelectorAll("input[data-field]")) {
-      metadata[input.dataset.field] = input.value.trim();
-    }
-    return {
-      id: card.dataset.trackId,
-      metadata,
-    };
-  });
-}
-
 async function pollJob(jobId) {
+  const sequence = ++pollSequence;
   const response = await fetch(`/api/jobs/${jobId}`);
   const data = await response.json();
   if (!response.ok) {
     throw new Error(data.detail || "Job not found");
   }
+  if (jobId !== currentJob || sequence < latestAppliedPoll) return;
+  latestAppliedPoll = sequence;
 
   jobBox.classList.remove("hidden");
   updateJobProgress(data);
+  lastJobData = data;
 
-  if (data.status === "review") {
+  if ((data.status === "running" && (data.tracks || []).length) || data.status === "review") {
     const firstReview = metadataReview.classList.contains("hidden");
     renderReview(data);
-    if (!data.lookup_active) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
-    if (firstReview) setNotice("Fallback metadata is ready. MusicBrainz suggestions will appear here.");
-    startButton.disabled = false;
+    if (firstReview) setNotice("Finished tracks appear here while download and metadata lookup continue.");
+    if (data.status === "review") startButton.disabled = false;
     if (firstReview) metadataReview.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
@@ -713,7 +785,7 @@ startButton.addEventListener("click", async () => {
     jobPhase.textContent = "Download";
     jobMessage.textContent = "Waiting to start";
     setNotice("");
-    pollTimer = setInterval(() => pollJob(currentJob).catch((error) => setNotice(error.message, true)), 1500);
+    pollTimer = setInterval(() => pollJob(currentJob).catch((error) => setNotice(error.message, true)), 1000);
     await pollJob(currentJob);
   } catch (error) {
     setNotice(error.message, true);
@@ -750,11 +822,10 @@ finalizeButton.addEventListener("click", async () => {
   if (!currentJob) return;
   finalizeButton.disabled = true;
   startButton.disabled = true;
-  setNotice("Writing tags and preparing the download...");
+  setNotice("Preparing the download...");
   try {
-    await postJson(`/api/jobs/${currentJob}/finalize`, { tracks: collectReviewTracks() });
+    await postJson(`/api/jobs/${currentJob}/finalize`, { tracks: [] });
     metadataReview.classList.add("hidden");
-    pollTimer = setInterval(() => pollJob(currentJob).catch((error) => setNotice(error.message, true)), 1500);
     await pollJob(currentJob);
   } catch (error) {
     setNotice(error.message, true);
@@ -762,8 +833,6 @@ finalizeButton.addEventListener("click", async () => {
     startButton.disabled = false;
   }
 });
-
-acceptAllButton.addEventListener("click", () => decideMatch("accept_all"));
 
 playlistRule.addEventListener("input", applyPlaylistMode);
 

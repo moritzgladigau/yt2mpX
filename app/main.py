@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import json
+import queue
 import os
 import re
 import shutil
@@ -29,6 +31,7 @@ from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
 from pydantic import BaseModel, Field
 from yt_dlp import YoutubeDL
+from yt_dlp.postprocessor.common import PostProcessor
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -53,6 +56,7 @@ musicbrainz_cooldown_until = 0.0
 musicbrainz_cache: dict[str, dict[str, Any]] = {}
 MUSICBRAINZ_INTERVAL_SECONDS = 1.1
 METADATA_JOB_TIMEOUT_SECONDS = 600
+tag_write_lock = threading.Lock()
 
 
 class MetadataHTTPError(RuntimeError):
@@ -101,9 +105,8 @@ class FinalizeRequest(BaseModel):
     tracks: list[FinalizeTrack] = Field(default_factory=list)
 
 
-class MatchDecision(BaseModel):
-    action: Literal["accept", "reject", "accept_all"]
-    track_id: str = ""
+class TrackUpdateRequest(BaseModel):
+    metadata: Metadata
 
 
 @dataclass
@@ -119,8 +122,14 @@ class Track:
     status: str = "fallback"
     message: str = ""
     lookup_status: str = "pending"
-    suggested_metadata: Metadata | None = None
     recording_id: str = ""
+    source_album: str = ""
+    source_date: str = ""
+    phase: str = "queued"
+    tag_status: str = "waiting"
+    tag_error: str = ""
+    metadata_revision: int = 0
+    written_revision: int = -1
 
 
 @dataclass
@@ -148,7 +157,12 @@ class Job:
     lookup_cancel: threading.Event = field(default_factory=threading.Event)
     state_lock: threading.RLock = field(default_factory=threading.RLock)
     lookup_finished: bool = False
-    lookup_deadline: float = 0.0
+    lookup_deadline: float = float("inf")
+    download_finished: bool = False
+    new_track_event: threading.Event = field(default_factory=threading.Event)
+    tag_queue: queue.Queue[str] = field(default_factory=queue.Queue)
+    tag_stop: threading.Event = field(default_factory=threading.Event)
+    cover_cache: dict[str, Path | None] = field(default_factory=dict)
 
 
 app = FastAPI(title="yt2mpX", version="1.0.0")
@@ -281,13 +295,19 @@ def track_response(track: Track) -> dict[str, Any]:
         "position": track.position,
         "source_title": track.source_title,
         "source_artist": track.source_artist,
+        "source_album": track.source_album,
+        "source_date": track.source_date,
         "source_cover_url": track.source_cover_url,
         "metadata": metadata_dict(track.metadata),
         "confidence": round(track.confidence, 3),
         "status": track.status,
         "message": track.message,
         "lookup_status": track.lookup_status,
-        "suggested_metadata": metadata_dict(track.suggested_metadata) if track.suggested_metadata else None,
+        "phase": track.phase,
+        "tag_status": track.tag_status,
+        "tag_error": track.tag_error,
+        "metadata_revision": track.metadata_revision,
+        "written_revision": track.written_revision,
         "file_name": track.path.name,
     }
 
@@ -577,110 +597,135 @@ def musicbrainz_metadata(recording_id: str, fallback: Metadata, job: Job | None 
     )
 
 
-def identify_track(path: Path, fallback: Metadata) -> tuple[Metadata, float, str, str]:
-    if not ACOUSTID_API_KEY:
-        return fallback, 0, "fallback", "No AcoustID API key is configured."
+def queue_track_tag(job: Job, track: Track) -> None:
+    with job.state_lock:
+        if track.written_revision >= track.metadata_revision or track.tag_status in {"queued", "writing"}:
+            return
+        track.tag_status = "queued"
+        track.phase = "tags_queued"
+        job.tag_queue.put(track.id)
+
+
+def finish_lookup_track(job: Job, track: Track, status: str, message: str, metadata: Metadata | None = None) -> None:
+    with job.state_lock:
+        if job.lookup_cancel.is_set() or track.lookup_status == "edited":
+            return
+        track.lookup_status = status
+        track.message = message
+        if metadata is not None:
+            track.metadata = metadata
+            track.metadata_revision += 1
+            track.status = "matched"
+        else:
+            track.status = "fallback"
+        queue_track_tag(job, track)
+
+
+def lookup_one_track(job: Job, track: Track) -> bool:
+    with job.state_lock:
+        if job.lookup_cancel.is_set() or track.lookup_status == "edited":
+            return False
+        track.lookup_status = "searching"
+        track.phase = "fingerprint" if not track.recording_id else "musicbrainz"
     try:
-        duration, fingerprint = fpcalc(path)
-        score, recording_id = acoustid_lookup(duration, fingerprint, fallback)
-        if score < ACOUSTID_MIN_SCORE:
-            return fallback, score, "fallback", "The AcoustID match was too uncertain."
-        metadata = musicbrainz_metadata(recording_id, fallback)
-        return metadata, score, "matched", "MusicBrainz match found."
+        if not ACOUSTID_API_KEY:
+            finish_lookup_track(job, track, "unavailable", "No AcoustID API key is configured.")
+            return False
+        if not track.recording_id:
+            duration, fingerprint = fpcalc(track.path)
+            with job.state_lock:
+                track.phase = "acoustid"
+            score, recording_id = acoustid_lookup(duration, fingerprint, track.metadata)
+            if score < ACOUSTID_MIN_SCORE:
+                with job.state_lock:
+                    track.confidence = score
+                finish_lookup_track(job, track, "no_match", "The AcoustID match was too uncertain.")
+                return False
+            with job.state_lock:
+                track.confidence = score
+                track.recording_id = recording_id
+        with job.state_lock:
+            track.phase = "musicbrainz"
+        metadata = musicbrainz_metadata(track.recording_id, track.metadata, job)
+        finish_lookup_track(job, track, "matched", "MusicBrainz match found.", metadata)
+    except MetadataHTTPError as exc:
+        if exc.status in {429, 502, 503, 504}:
+            with job.state_lock:
+                if not job.lookup_cancel.is_set() and track.lookup_status != "edited":
+                    track.lookup_status = "retrying"
+                    track.phase = "retrying"
+                    track.message = f"Metadata service returned HTTP {exc.status}; retrying after this pass."
+            return True
+        status = "no_match" if exc.status == 404 else "unavailable"
+        finish_lookup_track(job, track, status, str(exc))
     except FileNotFoundError:
-        return fallback, 0, "fallback", "fpcalc is not installed."
+        finish_lookup_track(job, track, "unavailable", "fpcalc is not installed.")
     except Exception as exc:
         message = str(exc)
         if "invalid api key" in message.casefold():
             message = "Invalid AcoustID API key. Use the Application API Key, not a user key."
-        return fallback, 0, "fallback", message
+        status = "no_match" if "no matching musicbrainz recording" in message.casefold() else "unavailable"
+        finish_lookup_track(job, track, status, message)
+    return False
 
 
 def lookup_job_metadata(job: Job) -> None:
-    pending = list(job.tracks)
+    next_index = 0
+    retry: list[Track] = []
     try:
-        while pending and not job.lookup_cancel.is_set() and time.monotonic() < job.lookup_deadline:
-            retry = []
-            for track in pending:
-                if job.lookup_cancel.is_set() or time.monotonic() >= job.lookup_deadline:
+        while not job.lookup_cancel.is_set():
+            if time.monotonic() >= job.lookup_deadline:
+                break
+            with job.state_lock:
+                track = job.tracks[next_index] if next_index < len(job.tracks) else None
+                download_finished = job.download_finished
+                if track is not None:
+                    next_index += 1
+            if track is None:
+                if download_finished:
                     break
-                with job.state_lock:
-                    if job.status != "review" or track.lookup_status in {"accepted", "rejected"}:
-                        continue
-                    track.lookup_status = "searching"
-                try:
-                    if not ACOUSTID_API_KEY:
-                        raise RuntimeError("No AcoustID API key is configured.")
-                    if not track.recording_id:
-                        duration, fingerprint = fpcalc(track.path)
-                        score, recording_id = acoustid_lookup(duration, fingerprint, track.metadata)
-                        if score < ACOUSTID_MIN_SCORE:
-                            with job.state_lock:
-                                if track.lookup_status not in {"accepted", "rejected"} and not job.lookup_cancel.is_set():
-                                    track.confidence = score
-                                    track.lookup_status = "no_match"
-                                    track.message = "The AcoustID match was too uncertain."
-                            continue
-                        with job.state_lock:
-                            if track.lookup_status in {"accepted", "rejected"} or job.lookup_cancel.is_set():
-                                continue
-                            track.confidence = score
-                            track.recording_id = recording_id
-                    suggestion = musicbrainz_metadata(track.recording_id, track.metadata, job)
-                    with job.state_lock:
-                        if job.status == "review" and not job.lookup_cancel.is_set() and time.monotonic() < job.lookup_deadline and track.lookup_status not in {"rejected", "accepted"}:
-                            track.suggested_metadata = suggestion
-                            track.lookup_status = "suggested"
-                            track.message = "MusicBrainz match found."
-                except MetadataHTTPError as exc:
-                    with job.state_lock:
-                        if job.lookup_cancel.is_set() or track.lookup_status in {"accepted", "rejected"}:
-                            continue
-                        if exc.status in {429, 502, 503, 504}:
-                            track.lookup_status = "retrying"
-                            track.message = f"MusicBrainz is temporarily unavailable ({exc.status}); retrying after this pass."
-                            retry.append(track)
-                        elif exc.status == 404:
-                            track.lookup_status = "no_match"
-                            track.message = "MusicBrainz has no recording for this match."
-                        else:
-                            track.lookup_status = "unavailable"
-                            track.message = str(exc)
-                except FileNotFoundError:
-                    with job.state_lock:
-                        if track.lookup_status not in {"accepted", "rejected"}:
-                            track.lookup_status = "unavailable"
-                            track.message = "fpcalc is not installed."
-                except Exception as exc:
-                    with job.state_lock:
-                        if not job.lookup_cancel.is_set() and track.lookup_status not in {"accepted", "rejected"}:
-                            message = str(exc)
-                            track.lookup_status = "no_match" if "no matching musicbrainz recording" in message.casefold() else "unavailable"
-                            track.message = "Invalid AcoustID API key. Use the Application API Key, not a user key." if "invalid api key" in message.casefold() else message
-            pending = retry
-        with job.state_lock:
-            if not job.lookup_cancel.is_set():
-                for track in job.tracks:
-                    if track.lookup_status in {"pending", "searching", "retrying"}:
-                        track.lookup_status = "unavailable"
-                        track.message = "The ten-minute metadata lookup limit was reached."
+                job.new_track_event.wait(0.25)
+                job.new_track_event.clear()
+                continue
+            if lookup_one_track(job, track):
+                retry.append(track)
+        while retry and not job.lookup_cancel.is_set() and time.monotonic() < job.lookup_deadline:
+            remaining = []
+            for track in retry:
+                if job.lookup_cancel.is_set() or time.monotonic() >= job.lookup_deadline:
+                    remaining.append(track)
+                    continue
+                if lookup_one_track(job, track):
+                    remaining.append(track)
+            retry = remaining
+        if not job.lookup_cancel.is_set():
+            with job.state_lock:
+                unfinished = [*retry, *job.tracks[next_index:]]
+            for track in unfinished:
+                finish_lookup_track(job, track, "unavailable", "The ten-minute metadata lookup limit was reached.")
     finally:
         with job.state_lock:
             job.lookup_finished = True
+        maybe_finish_review(job)
 
 
 def progress_hook(job: Job):
     def hook(data: dict[str, Any]) -> None:
         status = data.get("status")
+        total = max(1, len(set(job.playlist_items)))
         if status == "downloading":
             raw_percent = (data.get("_percent_str") or "").strip().replace("%", "")
             try:
                 percent = float(raw_percent)
-                touch(job, status="running", progress=1 + percent * 0.58, message="Downloading")
+                with job.state_lock:
+                    progress = 1 + (len(job.tracks) + percent / 100) / total * 65
+                    touch(job, status="running", progress=max(job.progress, min(progress, 66)), message="Downloading")
             except ValueError:
-                touch(job, status="running", message="Downloading")
+                with job.state_lock:
+                    touch(job, status="running", message="Downloading")
         elif status == "finished":
-            touch(job, status="running", progress=max(job.progress, 62), message="Converting file")
+            with job.state_lock:
+                touch(job, status="running", message="Converting file")
 
     return hook
 
@@ -729,7 +774,6 @@ def account_hls_format_selector(media_format: str, quality: str) -> str:
 def ydl_options(job: Job, work_dir: Path) -> dict[str, Any]:
     is_playlist_selection = bool(job.playlist_items)
     is_minimal_audio = job.media_format == "mp3" and is_minimal_audio_quality(job.audio_quality)
-    should_embed_cover = should_write_covers(job)
     if is_playlist_selection:
         outtmpl = str(work_dir / "%(title).170B __yt2mpx_%(playlist_index)05d.%(ext)s")
     else:
@@ -746,8 +790,6 @@ def ydl_options(job: Job, work_dir: Path) -> dict[str, Any]:
     }
     if is_playlist_selection:
         common["playlist_items"] = ",".join(str(item) for item in sorted(set(job.playlist_items)))
-    if is_playlist_selection and should_embed_cover:
-        common["writethumbnail"] = True
     if job.media_format == "mp3":
         postprocessors: list[dict[str, Any]] = [
             {
@@ -756,10 +798,6 @@ def ydl_options(job: Job, work_dir: Path) -> dict[str, Any]:
                 "preferredquality": mp3_quality_value(job.audio_quality),
             }
         ]
-        if is_playlist_selection:
-            postprocessors.append({"key": "FFmpegMetadata"})
-            if should_embed_cover:
-                postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
         common.update(
             {
                 "format": (
@@ -771,29 +809,18 @@ def ydl_options(job: Job, work_dir: Path) -> dict[str, Any]:
             }
         )
     else:
-        postprocessors = []
-        if is_playlist_selection:
-            postprocessors.extend(
-                [
-                    {"key": "FFmpegMetadata"},
-                    {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-                ]
-            )
         common.update(
             {
                 "format": account_hls_format_selector("mp4", job.video_quality) if job.use_youtube_cookies else mp4_format_selector(job.video_quality),
                 "merge_output_format": "mp4",
             }
         )
-        if postprocessors:
-            common["postprocessors"] = postprocessors
     return common
 
 
-def download_cover(url: str, work_dir: Path) -> Path | None:
+def download_cover(url: str, target_stem: Path) -> Path | None:
     if not url:
         return None
-    cover_path = work_dir / "cover"
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "yt2mpX/1.0"})
         with urllib.request.urlopen(request, timeout=20) as response:
@@ -801,7 +828,7 @@ def download_cover(url: str, work_dir: Path) -> Path | None:
             suffix = ".jpg"
             if "png" in content_type:
                 suffix = ".png"
-            final_path = cover_path.with_suffix(suffix)
+            final_path = target_stem.with_suffix(suffix)
             final_path.write_bytes(response.read())
             return final_path
     except Exception:
@@ -830,9 +857,12 @@ def apply_mp3_metadata(path: Path, metadata: Metadata, cover_path: Path | None) 
     audio = MP3(path, ID3=ID3)
     if audio.tags is None:
         audio.add_tags()
-    audio.save()
+        audio.save()
 
     easy = EasyID3(path)
+    for key in ("title", "artist", "album", "date", "tracknumber", "discnumber", "isrc", "musicbrainz_trackid", "musicbrainz_albumid", "musicbrainz_releasegroupid"):
+        if key in easy:
+            del easy[key]
     easy_set(easy, "title", metadata.title)
     easy_set(easy, "artist", metadata.artist)
     easy_set(easy, "album", metadata.album)
@@ -855,6 +885,8 @@ def apply_mp3_metadata(path: Path, metadata: Metadata, cover_path: Path | None) 
 
 def apply_mp4_metadata(path: Path, metadata: Metadata, cover_path: Path | None) -> None:
     video = MP4(path)
+    for key in ("\xa9nam", "\xa9ART", "\xa9alb", "\xa9day", "trkn", "disk", "----:com.apple.iTunes:ISRC", "----:com.apple.iTunes:MusicBrainz Track Id", "----:com.apple.iTunes:MusicBrainz Album Id", "----:com.apple.iTunes:MusicBrainz Release Group Id"):
+        video.pop(key, None)
     if metadata.title:
         video["\xa9nam"] = [metadata.title]
     if metadata.artist:
@@ -884,16 +916,25 @@ def apply_mp4_metadata(path: Path, metadata: Metadata, cover_path: Path | None) 
     video.save()
 
 
-def cover_for_track(track: Track, work_dir: Path) -> Path | None:
-    cover_url = track.metadata.cover_url.strip()
+def cover_for_track(track: Track, work_dir: Path, metadata: Metadata | None = None, cache: dict[str, Path | None] | None = None) -> Path | None:
+    cover_url = (metadata or track.metadata).cover_url.strip()
     if not cover_url:
         return None
-    cover_path = download_cover(cover_url, work_dir)
+    def get_cover(url: str) -> Path | None:
+        if cache is not None and url in cache:
+            return cache[url]
+        target_stem = work_dir / f"cover-{hashlib.sha256(url.encode('utf-8')).hexdigest()[:24]}"
+        path = download_cover(url, target_stem)
+        if cache is not None:
+            cache[url] = path
+        return path
+
+    cover_path = get_cover(cover_url)
     if cover_path:
         return cover_path
     fallback_cover_url = track.source_cover_url.strip()
     if fallback_cover_url and fallback_cover_url != cover_url:
-        return download_cover(fallback_cover_url, work_dir)
+        return get_cover(fallback_cover_url)
     return None
 
 
@@ -1023,9 +1064,111 @@ def build_tracks(job: Job, info: dict[str, Any], files: list[Path], file_positio
                 source_artist=fallback.artist,
                 source_cover_url=fallback.cover_url,
                 metadata=fallback,
+                source_album=fallback.album,
+                source_date=fallback.date,
             )
         )
     return tracks
+
+
+def register_ready_track(job: Job, work_dir: Path, info: dict[str, Any]) -> None:
+    path_text = first_text(info.get("filepath"), info.get("_filename"))
+    if not path_text:
+        return
+    path = Path(path_text).resolve()
+    if not path.is_relative_to(work_dir.resolve()) or not path.is_file() or path.suffix.lower() != f".{job.media_format}":
+        return
+    position = info.get("playlist_index")
+    if not isinstance(position, int) or position < 1:
+        position = playlist_position_from_name(path) or 1
+    collection_title = first_text(info.get("playlist_title"), job.collection_title)
+    fallback = fallback_metadata(info, collection_title)
+    with job.state_lock:
+        if any(track.path == path for track in job.tracks):
+            return
+        job.tracks.append(Track(
+            id=uuid.uuid4().hex,
+            path=path,
+            position=position,
+            source_title=fallback.title,
+            source_artist=fallback.artist,
+            source_cover_url=fallback.cover_url,
+            source_album=fallback.album,
+            source_date=fallback.date,
+            metadata=fallback,
+            phase="fingerprint",
+        ))
+        job.new_track_event.set()
+
+
+class ReadyTrackPostProcessor(PostProcessor):
+    def __init__(self, downloader: YoutubeDL, job: Job, work_dir: Path):
+        super().__init__(downloader)
+        self.job = job
+        self.work_dir = work_dir
+
+    def run(self, information: dict[str, Any]):
+        register_ready_track(self.job, self.work_dir, information)
+        return [], information
+
+
+def maybe_finish_review(job: Job) -> None:
+    with job.state_lock:
+        if job.status != "running" or not job.download_finished or not job.lookup_finished:
+            return
+        if not job.tracks or any(track.tag_status not in {"written", "error"} for track in job.tracks):
+            return
+        touch(job, status="review", progress=91, message="Review completed metadata")
+
+
+def write_track_tags(job: Job, track: Track) -> None:
+    with job.state_lock:
+        if track.written_revision >= track.metadata_revision:
+            track.tag_status = "written"
+            track.phase = "ready"
+            return
+        revision = track.metadata_revision
+        metadata = track.metadata.model_copy(deep=True)
+        track.tag_status = "writing"
+        track.phase = "tagging"
+        track.tag_error = ""
+    try:
+        with tag_write_lock:
+            work_dir = JOBS_DIR / job.id / "work"
+            cover_path = cover_for_track(track, work_dir, metadata, job.cover_cache) if should_write_covers(job) else None
+            if job.media_format == "mp3":
+                apply_mp3_metadata(track.path, metadata, cover_path)
+            else:
+                apply_mp4_metadata(track.path, metadata, cover_path)
+        with job.state_lock:
+            track.written_revision = revision
+            if track.metadata_revision != revision:
+                track.tag_status = "waiting"
+                queue_track_tag(job, track)
+            else:
+                track.tag_status = "written"
+                track.phase = "ready"
+    except Exception as exc:
+        with job.state_lock:
+            track.tag_status = "error"
+            track.phase = "tag_error"
+            track.tag_error = str(exc)
+
+
+def tag_job_metadata(job: Job) -> None:
+    while not job.tag_stop.is_set() or not job.tag_queue.empty():
+        try:
+            track_id = job.tag_queue.get(timeout=0.25)
+        except queue.Empty:
+            continue
+        try:
+            with job.state_lock:
+                track = next((item for item in job.tracks if item.id == track_id), None)
+            if track is not None and job.status != "failed":
+                write_track_tags(job, track)
+        finally:
+            job.tag_queue.task_done()
+            maybe_finish_review(job)
 
 
 def run_job(job: Job) -> None:
@@ -1035,8 +1178,11 @@ def run_job(job: Job) -> None:
 
     try:
         touch(job, status="running", progress=1, message="Checking link")
+        threading.Thread(target=tag_job_metadata, args=(job,), daemon=True).start()
+        threading.Thread(target=lookup_job_metadata, args=(job,), daemon=True).start()
         with yt_dlp_cookie_options(job.use_youtube_cookies) as cookie_options:
             with YoutubeDL({**ydl_options(job, work_dir), **cookie_options}) as ydl:
+                ydl.add_post_processor(ReadyTrackPostProcessor(ydl, job, work_dir), when="after_move")
                 info = ydl.extract_info(job.url, download=True)
                 job.is_playlist = bool(info.get("entries"))
                 job.collection_title = first_text(info.get("title"), "yt2mpX-download")
@@ -1045,17 +1191,22 @@ def run_job(job: Job) -> None:
         if not files:
             raise RuntimeError("No output file was created.")
         file_positions = [playlist_position_from_name(path) for path in files]
-        if job.playlist_items:
-            files = deduplicate_playlist_filenames(files)
-
         with job.state_lock:
-            job.tracks = build_tracks(job, info, files, file_positions)
+            for track in build_tracks(job, info, files, file_positions):
+                if not any(existing.path.resolve() == track.path.resolve() for existing in job.tracks):
+                    job.tracks.append(track)
+            job.new_track_event.set()
             job.lookup_deadline = time.monotonic() + METADATA_JOB_TIMEOUT_SECONDS
-            touch(job, status="review", progress=91, message="Review metadata; MusicBrainz lookup is running")
-        threading.Thread(target=lookup_job_metadata, args=(job,), daemon=True).start()
+            job.download_finished = True
+            touch(job, progress=70, message="Download complete; finishing metadata")
+        maybe_finish_review(job)
     except Exception as exc:
-        job.error = str(exc)
-        touch(job, status="failed", progress=0, message="Failed")
+        with job.state_lock:
+            job.lookup_cancel.set()
+            job.tag_stop.set()
+            job.new_track_event.set()
+            job.error = str(exc)
+            touch(job, status="failed", progress=0, message="Failed")
 
 
 def finalize_job(job: Job) -> None:
@@ -1064,16 +1215,22 @@ def finalize_job(job: Job) -> None:
     try:
         if not job.tracks:
             raise RuntimeError("No tracks were found to finalize.")
+        touch(job, status="finalizing", progress=93, message="Finishing remaining tags")
+        for track in job.tracks:
+            if track.tag_status == "error" or track.written_revision < track.metadata_revision:
+                with job.state_lock:
+                    track.tag_status = "waiting"
+                queue_track_tag(job, track)
+        job.tag_queue.join()
+        failed_tracks = [track for track in job.tracks if track.tag_status != "written"]
+        if failed_tracks:
+            raise RuntimeError(f"Could not write metadata for {len(failed_tracks)} track(s): {failed_tracks[0].tag_error}")
 
-        total_tracks = len(job.tracks)
-        for index, track in enumerate(job.tracks, start=1):
-            progress = 93 + ((index - 1) / max(total_tracks, 1)) * 4
-            touch(job, status="finalizing", progress=progress, message=f"Writing tags {index}/{total_tracks}")
-            cover_path = cover_for_track(track, work_dir) if should_write_covers(job) else None
-            if job.media_format == "mp3":
-                apply_mp3_metadata(track.path, track.metadata, cover_path)
-            else:
-                apply_mp4_metadata(track.path, track.metadata, cover_path)
+        if job.playlist_items:
+            ordered = sorted(job.tracks, key=lambda item: item.position)
+            renamed = deduplicate_playlist_filenames([track.path for track in ordered])
+            for track, path in zip(ordered, renamed):
+                track.path = path
 
         files = [track.path for track in sorted(job.tracks, key=lambda item: item.position) if track.path.exists()]
         if not files:
@@ -1093,6 +1250,8 @@ def finalize_job(job: Job) -> None:
     except Exception as exc:
         job.error = str(exc)
         touch(job, status="failed", progress=0, message="Failed")
+    finally:
+        job.tag_stop.set()
 
 
 async def cleanup_loop() -> None:
@@ -1102,6 +1261,7 @@ async def cleanup_loop() -> None:
         for job_id, job in list(jobs.items()):
             if job.updated_at < cutoff and job.status in {"done", "failed", "review"}:
                 job.lookup_cancel.set()
+                job.tag_stop.set()
                 shutil.rmtree(JOBS_DIR / job_id, ignore_errors=True)
                 jobs.pop(job_id, None)
 
@@ -1172,36 +1332,33 @@ async def get_job(job_id: str) -> dict[str, Any]:
             "download_size_bytes": job.output_path.stat().st_size if job.output_path and job.output_path.exists() else None,
             "unpacked_size_bytes": unpacked_zip_size(job.output_path) if job.output_path and job.output_path.exists() else None,
             "tracks": [track_response(track) for track in job.tracks],
-            "lookup_active": job.status == "review" and not job.lookup_finished and not job.lookup_cancel.is_set(),
+            "lookup_active": job.status == "running" and not job.lookup_finished and not job.lookup_cancel.is_set(),
+            "download_complete": job.download_finished,
+            "expected_tracks": len(set(job.playlist_items)) if job.playlist_items else max(1, len(job.tracks)),
             "created_at": job.created_at.isoformat(),
             "expires_after_minutes": JOB_TTL_MINUTES,
         }
 
 
-@app.post("/api/jobs/{job_id}/matches")
-async def decide_match(job_id: str, request: MatchDecision) -> dict[str, Any]:
+@app.patch("/api/jobs/{job_id}/tracks/{track_id}")
+async def update_track(job_id: str, track_id: str, request: TrackUpdateRequest) -> dict[str, Any]:
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found or already deleted.")
     with job.state_lock:
         if job.status != "review":
-            raise HTTPException(status_code=409, detail="Job is not ready for metadata review.")
-        targets = job.tracks if request.action == "accept_all" else [track for track in job.tracks if track.id == request.track_id]
-        if not targets:
+            raise HTTPException(status_code=409, detail="Wait until download and metadata lookup finish.")
+        track = next((item for item in job.tracks if item.id == track_id), None)
+        if track is None:
             raise HTTPException(status_code=404, detail="Track not found.")
-        for track in targets:
-            if request.action in {"accept", "accept_all"} and track.lookup_status == "suggested" and track.suggested_metadata:
-                track.metadata = track.suggested_metadata.model_copy(deep=True)
-                track.lookup_status = "accepted"
-                track.status = "matched"
-                track.message = "MusicBrainz suggestion accepted."
-            elif request.action == "reject" and track.lookup_status not in {"accepted", "rejected"}:
-                track.lookup_status = "rejected"
-                track.suggested_metadata = None
-                track.message = "MusicBrainz suggestion rejected; fallback metadata retained."
-            elif request.action != "accept_all":
-                raise HTTPException(status_code=409, detail="No pending suggestion is available for this track.")
-        return {"tracks": [track_response(track) for track in job.tracks], "lookup_active": not job.lookup_finished and not job.lookup_cancel.is_set()}
+        if track.metadata != request.metadata:
+            track.metadata = request.metadata
+            track.metadata_revision += 1
+            track.lookup_status = "edited"
+            track.status = "edited"
+            track.message = "Metadata edited manually."
+            queue_track_tag(job, track)
+        return {"track": track_response(track)}
 
 
 @app.post("/api/jobs/{job_id}/finalize")
@@ -1215,8 +1372,10 @@ async def finalize(job_id: str, request: FinalizeRequest) -> dict[str, str]:
         job.lookup_cancel.set()
         submitted = {track.id: track.metadata for track in request.tracks}
         for track in job.tracks:
-            if track.id in submitted:
+            if track.id in submitted and track.metadata != submitted[track.id]:
                 track.metadata = submitted[track.id]
+                track.metadata_revision += 1
+                queue_track_tag(job, track)
         touch(job, status="finalizing", progress=92, message="Finalizing download")
     asyncio.create_task(asyncio.to_thread(finalize_job, job))
     return {"job_id": job.id}

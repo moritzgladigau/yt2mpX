@@ -20,7 +20,13 @@ class FakeYoutubeDL:
 
     def __init__(self, options):
         self.options = options
+        self.params = options
+        self.processor = None
         self.calls.append(self)
+
+    def add_post_processor(self, processor, when):
+        assert when == "after_move"
+        self.processor = processor
 
     def __enter__(self):
         return self
@@ -34,7 +40,9 @@ class FakeYoutubeDL:
             assert Path(cookiefile).is_file()
             assert "TEST_SESSION" in Path(cookiefile).read_text()
         if download:
-            Path(self.options["outtmpl"]).parent.joinpath("Example.mp3").write_bytes(b"dummy")
+            path = Path(self.options["outtmpl"]).parent.joinpath("Example.mp3")
+            path.write_bytes(b"dummy")
+            self.processor.run.__wrapped__(self.processor, {"filepath": str(path), "title": "Example", "artist": "Artist"})
         return {"title": "Example", "artist": "Artist", "thumbnail": ""}
 
 
@@ -56,18 +64,21 @@ class YoutubeCookieTests(unittest.TestCase):
     def test_anonymous_probe_and_job_do_not_use_cookiefile(self):
         main.run_probe("https://www.youtube.com/watch?v=example")
         job = main.Job("anonymous", "https://www.youtube.com/watch?v=example", "mp3", "browser")
-        with patch.object(main, "JOBS_DIR", self.root), patch.object(main, "lookup_job_metadata"):
+        with patch.object(main, "JOBS_DIR", self.root), patch.object(main, "lookup_job_metadata"), patch.object(main, "tag_job_metadata"):
             main.run_job(job)
-        self.assertEqual(job.status, "review")
+        self.assertEqual(job.status, "running", job.error)
+        self.assertTrue(job.download_finished)
+        self.assertEqual(len(job.tracks), 1, [str(track.path) for track in job.tracks])
         self.assertEqual(len(FakeYoutubeDL.calls), 2)
         self.assertTrue(all("cookiefile" not in call.options for call in FakeYoutubeDL.calls))
 
     def test_account_probe_and_job_use_private_temporary_copies(self):
         main.run_probe("https://www.youtube.com/watch?v=example", True)
         job = main.Job("account", "https://www.youtube.com/watch?v=example", "mp3", "browser", use_youtube_cookies=True)
-        with patch.object(main, "JOBS_DIR", self.root), patch.object(main, "lookup_job_metadata"):
+        with patch.object(main, "JOBS_DIR", self.root), patch.object(main, "lookup_job_metadata"), patch.object(main, "tag_job_metadata"):
             main.run_job(job)
-        self.assertEqual(job.status, "review")
+        self.assertEqual(job.status, "running", job.error)
+        self.assertTrue(job.download_finished)
         paths = [Path(call.options["cookiefile"]) for call in FakeYoutubeDL.calls]
         self.assertEqual(len(paths), 2)
         self.assertNotEqual(paths[0], self.cookie_path)

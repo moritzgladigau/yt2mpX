@@ -6,8 +6,6 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
-from fastapi import HTTPException
-
 from app import main
 
 
@@ -16,8 +14,9 @@ def track(number):
 
 
 def job_with_tracks(count=2):
-    job = main.Job("lookup-test", "url", "mp3", "session", status="review", tracks=[track(i) for i in range(count)])
+    job = main.Job("lookup-test", "url", "mp3", "session", status="running", tracks=[track(i) for i in range(count)])
     job.lookup_deadline = time.monotonic() + 600
+    job.download_finished = True
     return job
 
 
@@ -49,9 +48,9 @@ class MusicBrainzLookupTests(unittest.TestCase):
         with patch.object(main, "ACOUSTID_API_KEY", "key"), patch.object(main, "fpcalc", return_value=(100, "fingerprint")), patch.object(main, "acoustid_lookup", side_effect=lambda _d, _f, fallback: (0.99, f"rec-{fallback.title[-1]}")), patch.object(main, "musicbrainz_metadata", side_effect=lookup):
             main.lookup_job_metadata(job)
         self.assertEqual(calls, ["rec-0", "rec-1", "rec-2", "rec-0"])
-        self.assertTrue(all(item.lookup_status == "suggested" for item in job.tracks))
-        self.assertEqual(job.tracks[0].metadata.title, "Track 0")
-        self.assertEqual(job.tracks[0].suggested_metadata.title, "Found rec-0")
+        self.assertTrue(all(item.lookup_status == "matched" for item in job.tracks))
+        self.assertEqual(job.tracks[0].metadata.title, "Found rec-0")
+        self.assertTrue(all(item.tag_status == "queued" for item in job.tracks))
 
     def test_global_rate_cache_and_overload_pause(self):
         calls = []
@@ -87,57 +86,31 @@ class MusicBrainzLookupTests(unittest.TestCase):
         with patch.object(main, "ACOUSTID_API_KEY", "key"), patch.object(main, "fpcalc", return_value=(100, "fingerprint")), patch.object(main, "acoustid_lookup", side_effect=[(0.99, "same"), (0.99, "other"), (0.99, "same")]), patch.object(main, "musicbrainz_metadata", side_effect=lookup):
             main.lookup_job_metadata(job)
         self.assertEqual(calls[:3], ["same", "other", "same"])
-        self.assertTrue(all(item.lookup_status == "suggested" for item in job.tracks))
+        self.assertTrue(all(item.lookup_status == "matched" for item in job.tracks))
 
-    def test_reject_while_response_is_in_flight(self):
+    def test_cancel_while_response_is_in_flight(self):
         job = job_with_tracks(1)
-        main.jobs[job.id] = job
-        self.addCleanup(main.jobs.pop, job.id, None)
 
         def lookup(_recording_id, _fallback, _job):
-            asyncio.run(main.decide_match(job.id, main.MatchDecision(action="reject", track_id="0")))
+            job.lookup_cancel.set()
             return main.Metadata(title="Late match")
 
         with patch.object(main, "ACOUSTID_API_KEY", "key"), patch.object(main, "fpcalc", return_value=(100, "fingerprint")), patch.object(main, "acoustid_lookup", return_value=(0.99, "same")), patch.object(main, "musicbrainz_metadata", side_effect=lookup):
             main.lookup_job_metadata(job)
-        self.assertEqual(job.tracks[0].lookup_status, "rejected")
-        self.assertIsNone(job.tracks[0].suggested_metadata)
+        self.assertEqual(job.tracks[0].metadata.title, "Track 0")
+        self.assertEqual(job.tracks[0].tag_status, "waiting")
 
-    def test_deadline_and_decisions(self):
+    def test_deadline_writes_fallback_for_unresolved_tracks(self):
         job = job_with_tracks()
         job.lookup_deadline = time.monotonic() - 1
         main.lookup_job_metadata(job)
         self.assertTrue(job.lookup_finished)
         self.assertTrue(all(item.lookup_status == "unavailable" for item in job.tracks))
-
-        job.lookup_deadline = time.monotonic() + 600
-        for item in job.tracks:
-            item.suggested_metadata = main.Metadata(title=f"Found {item.id}")
-            item.lookup_status = "suggested"
-        main.jobs[job.id] = job
-        self.addCleanup(main.jobs.pop, job.id, None)
-        asyncio.run(main.decide_match(job.id, main.MatchDecision(action="reject", track_id="0")))
-        asyncio.run(main.decide_match(job.id, main.MatchDecision(action="accept_all")))
-        self.assertEqual(job.tracks[0].metadata.title, "Track 0")
-        self.assertEqual(job.tracks[0].lookup_status, "rejected")
-        self.assertEqual(job.tracks[1].metadata.title, "Found 1")
-        with self.assertRaises(HTTPException):
-            asyncio.run(main.decide_match(job.id, main.MatchDecision(action="accept", track_id="0")))
-
-    def test_accept_one_leaves_other_suggestion_pending(self):
-        job = job_with_tracks()
-        for item in job.tracks:
-            item.suggested_metadata = main.Metadata(title=f"Found {item.id}")
-            item.lookup_status = "suggested"
-        main.jobs[job.id] = job
-        self.addCleanup(main.jobs.pop, job.id, None)
-        result = asyncio.run(main.decide_match(job.id, main.MatchDecision(action="accept", track_id="0")))
-        self.assertEqual(result["tracks"][0]["metadata"]["title"], "Found 0")
-        self.assertEqual(result["tracks"][1]["metadata"]["title"], "Track 1")
-        self.assertEqual(result["tracks"][1]["lookup_status"], "suggested")
+        self.assertTrue(all(item.tag_status == "queued" for item in job.tracks))
 
     def test_finalize_cancels_late_lookup(self):
         job = job_with_tracks(1)
+        job.status = "review"
         main.jobs[job.id] = job
         self.addCleanup(main.jobs.pop, job.id, None)
         with patch.object(main, "finalize_job"):
