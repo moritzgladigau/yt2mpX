@@ -630,9 +630,11 @@ progress {
 
 .review-list {
   display: grid;
+  align-content: start;
   gap: 12px;
-  max-height: min(520px, 52dvh);
+  height: min(520px, 45dvh);
   overflow: auto;
+  overscroll-behavior: contain;
   padding-right: 4px;
 }
 
@@ -1065,12 +1067,6 @@ progress {
 
   .playlist ol {
     max-height: 180px;
-  }
-
-  .review-list {
-    max-height: none;
-    overflow: visible;
-    padding-right: 0;
   }
 
   .review-fields,

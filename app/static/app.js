@@ -22,6 +22,7 @@ const excludeLongVideosButton = document.querySelector("#exclude-long-videos");
 const startButton = document.querySelector("#start-button");
 const probeButton = document.querySelector("#probe-button");
 const jobBox = document.querySelector("#job");
+const jobTop = jobBox.querySelector(".job-top");
 const jobPhase = document.querySelector("#job-phase");
 const jobMessage = document.querySelector("#job-message");
 const jobPercent = document.querySelector("#job-percent");
@@ -58,6 +59,32 @@ let selectedVideoQuality = "best_compatible";
 let embedCover = true;
 const longVideoThresholdSeconds = 10 * 60;
 const qualityPreferenceCookie = "yt2mpx-quality-preferences";
+
+function scrollBehavior() {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+}
+
+function focusJobProgress() {
+  const panel = jobBox.closest(".panel");
+  if (panel.scrollHeight > panel.clientHeight + 1) {
+    const top = panel.scrollTop + jobTop.getBoundingClientRect().top - panel.getBoundingClientRect().top - 16;
+    panel.scrollTo({ top, behavior: scrollBehavior() });
+  } else {
+    jobTop.scrollIntoView({ block: "start", behavior: scrollBehavior() });
+  }
+}
+
+function followNewTrack(card) {
+  if (openEditorId || reviewList.scrollHeight <= reviewList.clientHeight) return;
+  const list = reviewList.getBoundingClientRect();
+  const track = card.getBoundingClientRect();
+  if (track.top >= list.top && track.bottom <= list.bottom) return;
+  const offset = track.bottom > list.bottom ? track.bottom - list.bottom + 8 : track.top - list.top - 8;
+  reviewList.scrollTo({
+    top: reviewList.scrollTop + offset,
+    behavior: scrollBehavior(),
+  });
+}
 
 const qualityOptions = {
   mp3: [
@@ -672,14 +699,17 @@ function syncReview(data) {
 function renderReview(data) {
   metadataReview.classList.remove("hidden");
   let added = false;
+  let newestCard = null;
   for (const track of data.tracks || []) {
     if (!reviewList.querySelector(`[data-track-id="${track.id}"]`)) {
-      reviewList.appendChild(makeReviewCard(track));
+      newestCard = makeReviewCard(track);
+      reviewList.appendChild(newestCard);
       added = true;
     }
   }
   if (added) [...reviewList.children].sort((a, b) => Number(a.dataset.position) - Number(b.dataset.position)).forEach((card) => reviewList.appendChild(card));
   syncReview(data);
+  if (newestCard) followNewTrack(newestCard);
 }
 
 async function pollJob(jobId) {
@@ -696,12 +726,12 @@ async function pollJob(jobId) {
   updateJobProgress(data);
   lastJobData = data;
 
-  if ((data.status === "running" && (data.tracks || []).length) || data.status === "review") {
+  if (data.status === "running" || data.status === "review") {
     const firstReview = metadataReview.classList.contains("hidden");
     renderReview(data);
     if (firstReview) setNotice("Finished tracks appear here while download and metadata lookup continue.");
     if (data.status === "review") startButton.disabled = false;
-    if (firstReview) metadataReview.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (firstReview) requestAnimationFrame(focusJobProgress);
   }
 
   if (data.status === "done") {
@@ -785,6 +815,8 @@ startButton.addEventListener("click", async () => {
     jobPhase.textContent = "Download";
     jobMessage.textContent = "Waiting to start";
     setNotice("");
+    renderReview({ tracks: [], expected_tracks: payload.playlist_items?.length || 1, status: "running" });
+    requestAnimationFrame(focusJobProgress);
     pollTimer = setInterval(() => pollJob(currentJob).catch((error) => setNotice(error.message, true)), 1000);
     await pollJob(currentJob);
   } catch (error) {
