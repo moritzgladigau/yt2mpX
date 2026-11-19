@@ -1139,17 +1139,22 @@ def write_track_tags(job: Job, track: Track) -> None:
     try:
         with tag_write_lock:
             work_dir = JOBS_DIR / job.id / "work"
-            cover_path = cover_for_track(track, work_dir, metadata, job.cover_cache) if should_write_covers(job) else None
+            cover_path = cover_for_track(track, work_dir, metadata, job.cover_cache)
+            candidate_cover_url = metadata.cover_url.strip()
+            if candidate_cover_url and job.cover_cache.get(candidate_cover_url) is None:
+                metadata.cover_url = track.source_cover_url
+            embedded_cover_path = cover_path if should_write_covers(job) else None
             if job.media_format == "mp3":
-                apply_mp3_metadata(track.path, metadata, cover_path)
+                apply_mp3_metadata(track.path, metadata, embedded_cover_path)
             else:
-                apply_mp4_metadata(track.path, metadata, cover_path)
+                apply_mp4_metadata(track.path, metadata, embedded_cover_path)
         with job.state_lock:
             track.written_revision = revision
             if track.metadata_revision != revision:
                 track.tag_status = "waiting"
                 queue_track_tag(job, track)
             else:
+                track.metadata.cover_url = metadata.cover_url
                 track.tag_status = "written"
                 track.phase = "ready"
     except Exception as exc:

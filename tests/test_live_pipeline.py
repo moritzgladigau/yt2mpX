@@ -136,6 +136,40 @@ class LivePipelineTests(unittest.TestCase):
         self.assertEqual(track.metadata.title, "YouTube title")
         self.assertEqual(track.tag_status, "queued")
 
+    def test_missing_musicbrainz_cover_uses_youtube_cover(self):
+        candidate = "https://coverartarchive.org/release/missing/front-500"
+        fallback = "https://i.ytimg.com/vi/example/default.jpg"
+        fallback_path = self.root / "fallback.jpg"
+        fallback_path.write_bytes(b"image")
+        track = main.Track("one", self.root / "one.mp3", 1, "Song", "Uploader", fallback, main.Metadata(title="Matched", cover_url=candidate))
+        job = main.Job("cover", "url", "mp3", "session", tracks=[track])
+        applied = []
+
+        def download(url, _target):
+            return None if url == candidate else fallback_path
+
+        with patch.object(main, "JOBS_DIR", self.root), patch.object(main, "download_cover", side_effect=download), patch.object(main, "apply_mp3_metadata", side_effect=lambda _path, metadata, cover: applied.append((metadata.cover_url, cover))):
+            main.write_track_tags(job, track)
+
+        self.assertEqual(track.tag_status, "written")
+        self.assertEqual(track.metadata.cover_url, fallback)
+        self.assertEqual(applied, [(fallback, fallback_path)])
+
+    def test_musicbrainz_cover_is_checked_even_without_embedding(self):
+        candidate = "https://coverartarchive.org/release/present/front-500"
+        cover_path = self.root / "cover.jpg"
+        cover_path.write_bytes(b"image")
+        track = main.Track("one", self.root / "one.mp3", 1, "Song", "Uploader", "", main.Metadata(title="Matched", cover_url=candidate))
+        job = main.Job("cover", "url", "mp3", "session", tracks=[track], embed_cover=False)
+        applied = []
+
+        with patch.object(main, "JOBS_DIR", self.root), patch.object(main, "download_cover", return_value=cover_path) as download, patch.object(main, "apply_mp3_metadata", side_effect=lambda _path, metadata, cover: applied.append((metadata.cover_url, cover))):
+            main.write_track_tags(job, track)
+
+        download.assert_called_once()
+        self.assertEqual(track.metadata.cover_url, candidate)
+        self.assertEqual(applied, [(candidate, None)])
+
     def test_manual_edit_only_requeues_that_track(self):
         tracks = [main.Track(str(i), Path(f"{i}.mp3"), i, f"Song {i}", "", "", main.Metadata(title=f"Song {i}"), tag_status="written", written_revision=0) for i in (1, 2)]
         job = main.Job("edit", "url", "mp3", "session", status="review", tracks=tracks)

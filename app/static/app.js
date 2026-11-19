@@ -686,7 +686,7 @@ function syncReview(data) {
     const source = card.querySelector(".review-youtube").children;
     [metadata.title, metadata.artist, metadata.album].forEach((value, i) => { current[i].textContent = value || "—"; });
     [track.source_title, track.source_artist, track.source_album].forEach((value, i) => { source[i].textContent = value || "—"; });
-    setCover(card.querySelector(".review-cover"), metadata.cover_url, track.source_cover_url);
+    setCover(card.querySelector(".review-cover"), track.tag_status === "written" ? metadata.cover_url : track.source_cover_url, track.source_cover_url);
     const status = card.querySelector(".match-pill");
     status.textContent = trackPhaseLabels[track.phase] || track.phase || "Waiting";
     status.title = track.tag_error || track.message || "";
