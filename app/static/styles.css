@@ -638,7 +638,7 @@ progress {
 
 .review-column-head {
   display: grid;
-  grid-template-columns: 48px repeat(3, minmax(0, 1fr)) 152px;
+  grid-template-columns: 48px repeat(3, minmax(0, 1fr)) 190px;
   gap: 12px;
   padding: 0 12px;
   color: var(--muted);
@@ -658,7 +658,7 @@ progress {
 
 .review-row {
   display: grid;
-  grid-template-columns: 48px minmax(0, 1fr) 152px;
+  grid-template-columns: 48px minmax(0, 1fr) 190px;
   gap: 12px;
   align-items: center;
 }
@@ -708,7 +708,7 @@ progress {
 
 .review-status {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
@@ -831,7 +831,7 @@ progress {
   .review-column-head { display: none; }
   .review-row { grid-template-columns: 48px minmax(0, 1fr); }
   .review-data { gap: 7px; }
-  .review-status { grid-column: 2; justify-content: flex-start; }
+  .review-status { grid-column: 2; flex-wrap: wrap; justify-content: flex-start; }
 }
 
 .review-suggestion {
