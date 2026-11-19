@@ -610,6 +610,10 @@ def finish_lookup_track(job: Job, track: Track, status: str, message: str, metad
     with job.state_lock:
         if job.lookup_cancel.is_set() or track.lookup_status == "edited":
             return
+        if time.monotonic() >= job.lookup_deadline:
+            status = "unavailable"
+            message = "The ten-minute metadata lookup limit was reached."
+            metadata = None
         track.lookup_status = status
         track.message = message
         if metadata is not None:

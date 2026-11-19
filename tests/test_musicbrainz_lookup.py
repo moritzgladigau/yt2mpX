@@ -108,6 +108,19 @@ class MusicBrainzLookupTests(unittest.TestCase):
         self.assertTrue(all(item.lookup_status == "unavailable" for item in job.tracks))
         self.assertTrue(all(item.tag_status == "queued" for item in job.tracks))
 
+    def test_late_musicbrainz_response_does_not_replace_fallback(self):
+        job = job_with_tracks(1)
+
+        def late_result(_recording_id, _fallback, _job):
+            job.lookup_deadline = time.monotonic() - 1
+            return main.Metadata(title="Too late")
+
+        with patch.object(main, "ACOUSTID_API_KEY", "key"), patch.object(main, "fpcalc", return_value=(100, "fingerprint")), patch.object(main, "acoustid_lookup", return_value=(0.99, "recording")), patch.object(main, "musicbrainz_metadata", side_effect=late_result):
+            main.lookup_job_metadata(job)
+        self.assertEqual(job.tracks[0].metadata.title, "Track 0")
+        self.assertEqual(job.tracks[0].lookup_status, "unavailable")
+        self.assertEqual(job.tracks[0].tag_status, "queued")
+
     def test_finalize_cancels_late_lookup(self):
         job = job_with_tracks(1)
         job.status = "review"
