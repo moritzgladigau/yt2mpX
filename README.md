@@ -25,8 +25,9 @@ The Docker image includes Deno and yt-dlp's JavaScript challenge solver. If you 
 ## How it works
 
 1. Check a video or playlist URL. Choose the format, quality, and playlist items.
-2. The app downloads and converts the media, then shows editable YouTube fallback metadata immediately. With an AcoustID key, it searches Chromaprint/fpcalc, AcoustID, and MusicBrainz in the background.
-3. MusicBrainz matches appear as separate suggestions. Accept or reject each match, or accept all matches found so far. You can edit the fields and prepare the download at any time; doing so ends the search. A rejected match keeps the fallback fields. Matches arriving later stay available until you prepare the download.
+2. As each file finishes downloading and converting, it appears in a compact track list with a small cover, YouTube title, artist and album, and a live status badge. Fingerprinting and metadata lookup start while later files are still downloading.
+3. A confident AcoustID/MusicBrainz match becomes the active metadata automatically and is written into that finished file, including its cover. A definite no-match uses and writes the YouTube fallback. Temporary errors such as HTTP 503 remain untagged and are retried after the first pass.
+4. When every file and lookup is finished, use the pencil on a track to edit only that track. Its tags are rewritten if the metadata changes. Choose **Prepare download** to package the already tagged files. The original YouTube title, artist and album stay visible below the active data for comparison.
 
 Playlist items can be selected with checkboxes or ranges such as `1-20`, `1-20,45,60`, and `4,8,12`. Playlists are delivered as ZIP files. The app shows the download size and, for ZIP files, the approximate extracted size. Temporary downloads are listed in the browser's history panel while they remain available on the server.
 
@@ -57,7 +58,7 @@ Docker Compose reads `.env` automatically. To enable fingerprint matching, sign 
 
 MusicBrainz does not require an API key for metadata lookups. Set `YTMPX_MUSICBRAINZ_USER_AGENT` to an application name and version with a contact URL or email address, following the [MusicBrainz User-Agent guidelines](https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting#Provide_meaningful_User-Agent_strings).
 
-Metadata lookup visits every track once, then retries only temporary service errors in later passes. MusicBrainz requests are spaced at least 1.1 seconds apart across all jobs. The app honors `Retry-After`, pauses after repeated HTTP 503 responses, and ends a job's metadata search after ten minutes. Accepted suggestions never replace later manual edits automatically.
+Metadata lookup visits every finished track once, then retries only temporary service errors in later passes. MusicBrainz requests are spaced at least 1.1 seconds apart across all jobs. The app honors `Retry-After` and pauses after repeated HTTP 503 responses. The ten-minute limit for unresolved lookups starts after the last file finishes downloading; remaining tracks then receive YouTube fallback tags. File tagging runs one track at a time across jobs, while downloads and lookups continue. The final ZIP is built only after all files and tag writes are complete.
 
 Keep `.env` private; only `.env.example`, which contains no credentials, belongs in Git.
 
