@@ -32,6 +32,7 @@ const metadataReview = document.querySelector("#metadata-review");
 const reviewSummary = document.querySelector("#review-summary");
 const reviewList = document.querySelector("#review-list");
 const finalizeButton = document.querySelector("#finalize-button");
+const acceptAllButton = document.querySelector("#accept-all-button");
 const coverToggle = document.querySelector("#cover-toggle");
 const coverInput = document.querySelector("#minimal-cover");
 const historyToggle = document.querySelector("#history-toggle");
@@ -148,6 +149,7 @@ function resetJobUi() {
   reviewList.replaceChildren();
   reviewSummary.textContent = "";
   finalizeButton.disabled = false;
+  acceptAllButton.disabled = false;
   downloadLink.classList.add("hidden");
   downloadLink.removeAttribute("href");
   downloadLink.removeAttribute("download");
@@ -488,12 +490,10 @@ function makeInput(field, label, value, type = "text") {
 
 function renderReview(data) {
   const tracks = data.tracks || [];
-  const matched = tracks.filter((track) => track.status === "matched").length;
   metadataReview.classList.remove("hidden");
-  reviewSummary.textContent = `${tracks.length} track${tracks.length === 1 ? "" : "s"} ready; ${matched} matched in MusicBrainz.`;
-  reviewList.replaceChildren();
 
   for (const track of tracks) {
+    if (reviewList.querySelector(`[data-track-id="${track.id}"]`)) continue;
     const metadata = track.metadata || {};
     const article = document.createElement("article");
     article.className = "review-card";
@@ -504,10 +504,7 @@ function renderReview(data) {
     const title = document.createElement("strong");
     title.textContent = `${track.position}. ${fieldValue(metadata, "title") || track.source_title || "Untitled track"}`;
     const status = document.createElement("span");
-    status.className = track.status === "matched" ? "match-pill matched" : "match-pill fallback";
-    status.textContent = track.status === "matched"
-      ? `Matched ${Math.round((track.confidence || 0) * 100)}%`
-      : "Fallback";
+    status.className = "match-pill fallback";
     head.append(title, status);
 
     const source = document.createElement("p");
@@ -540,8 +537,63 @@ function renderReview(data) {
     );
     details.append(summary, extraFields);
 
-    article.append(head, source, mainFields, details);
+    const suggestion = document.createElement("div");
+    suggestion.className = "review-suggestion";
+    const suggestionText = document.createElement("span");
+    const accept = document.createElement("button");
+    accept.type = "button";
+    accept.textContent = "Accept";
+    accept.addEventListener("click", () => decideMatch("accept", track.id));
+    const reject = document.createElement("button");
+    reject.type = "button";
+    reject.textContent = "Reject";
+    reject.addEventListener("click", () => decideMatch("reject", track.id));
+    suggestion.append(suggestionText, accept, reject);
+    article.append(head, source, suggestion, mainFields, details);
     reviewList.appendChild(article);
+  }
+  syncReview(data);
+}
+
+function syncReview(data, newlyAccepted = new Set()) {
+  const tracks = data.tracks || [];
+  const found = tracks.filter((track) => track.lookup_status === "suggested").length;
+  const accepted = tracks.filter((track) => track.lookup_status === "accepted").length;
+  reviewSummary.textContent = `${tracks.length} tracks ready; ${found} suggestions, ${accepted} accepted.${data.lookup_active ? " Search continues in the background." : " Search finished."}`;
+  acceptAllButton.disabled = found === 0;
+  for (const track of tracks) {
+    const card = reviewList.querySelector(`[data-track-id="${track.id}"]`);
+    if (!card) continue;
+    const status = card.querySelector(".match-pill");
+    const source = card.querySelector(".review-source");
+    const suggestion = card.querySelector(".review-suggestion");
+    const suggestionText = suggestion.querySelector("span");
+    const canDecide = track.lookup_status === "suggested";
+    status.textContent = track.lookup_status.replaceAll("_", " ");
+    status.className = `match-pill ${canDecide || track.lookup_status === "accepted" ? "matched" : "fallback"}`;
+    source.textContent = track.message || track.source_title || track.file_name || "";
+    suggestionText.textContent = canDecide
+      ? `${track.suggested_metadata?.title || ""} — ${track.suggested_metadata?.artist || ""} (${Math.round((track.confidence || 0) * 100)}%)`
+      : "";
+    suggestion.classList.toggle("hidden", !canDecide);
+    if (newlyAccepted.has(track.id)) {
+      for (const input of card.querySelectorAll("input[data-field]")) {
+        input.value = fieldValue(track.metadata, input.dataset.field);
+      }
+    }
+    card.dataset.accepted = track.lookup_status === "accepted" ? "true" : "false";
+  }
+}
+
+async function decideMatch(action, trackId = "") {
+  if (!currentJob) return;
+  try {
+    const previouslyAccepted = new Set([...reviewList.querySelectorAll('.review-card[data-accepted="true"]')].map((card) => card.dataset.trackId));
+    const data = await postJson(`/api/jobs/${currentJob}/matches`, { action, track_id: trackId });
+    const newlyAccepted = new Set(data.tracks.filter((track) => track.lookup_status === "accepted" && !previouslyAccepted.has(track.id)).map((track) => track.id));
+    syncReview(data, newlyAccepted);
+  } catch (error) {
+    setNotice(error.message, true);
   }
 }
 
@@ -569,12 +621,15 @@ async function pollJob(jobId) {
   updateJobProgress(data);
 
   if (data.status === "review") {
-    clearInterval(pollTimer);
-    pollTimer = null;
+    const firstReview = metadataReview.classList.contains("hidden");
     renderReview(data);
-    setNotice("Metadata is ready. Review it, then prepare your download.");
+    if (!data.lookup_active) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (firstReview) setNotice("Fallback metadata is ready. MusicBrainz suggestions will appear here.");
     startButton.disabled = false;
-    metadataReview.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (firstReview) metadataReview.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   if (data.status === "done") {
@@ -707,6 +762,8 @@ finalizeButton.addEventListener("click", async () => {
     startButton.disabled = false;
   }
 });
+
+acceptAllButton.addEventListener("click", () => decideMatch("accept_all"));
 
 playlistRule.addEventListener("input", applyPlaylistMode);
 

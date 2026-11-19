@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.utils import parsedate_to_datetime
 import uuid
 import zipfile
 from contextlib import contextmanager
@@ -47,6 +48,18 @@ MAX_DOWNLOAD_STEM_LENGTH = 180
 
 musicbrainz_lock = threading.Lock()
 last_musicbrainz_request_at = 0.0
+musicbrainz_consecutive_503 = 0
+musicbrainz_cooldown_until = 0.0
+musicbrainz_cache: dict[str, dict[str, Any]] = {}
+MUSICBRAINZ_INTERVAL_SECONDS = 1.1
+METADATA_JOB_TIMEOUT_SECONDS = 600
+
+
+class MetadataHTTPError(RuntimeError):
+    def __init__(self, status: int, message: str, retry_after: float = 0):
+        super().__init__(f"HTTP {status}: {message}")
+        self.status = status
+        self.retry_after = retry_after
 
 
 class ProbeRequest(BaseModel):
@@ -88,6 +101,11 @@ class FinalizeRequest(BaseModel):
     tracks: list[FinalizeTrack] = Field(default_factory=list)
 
 
+class MatchDecision(BaseModel):
+    action: Literal["accept", "reject", "accept_all"]
+    track_id: str = ""
+
+
 @dataclass
 class Track:
     id: str
@@ -100,6 +118,9 @@ class Track:
     confidence: float = 0
     status: str = "fallback"
     message: str = ""
+    lookup_status: str = "pending"
+    suggested_metadata: Metadata | None = None
+    recording_id: str = ""
 
 
 @dataclass
@@ -124,6 +145,10 @@ class Job:
     is_playlist: bool = False
     collection_title: str = ""
     tracks: list[Track] = field(default_factory=list)
+    lookup_cancel: threading.Event = field(default_factory=threading.Event)
+    state_lock: threading.RLock = field(default_factory=threading.RLock)
+    lookup_finished: bool = False
+    lookup_deadline: float = 0.0
 
 
 app = FastAPI(title="yt2mpX", version="1.0.0")
@@ -261,6 +286,8 @@ def track_response(track: Track) -> dict[str, Any]:
         "confidence": round(track.confidence, 3),
         "status": track.status,
         "message": track.message,
+        "lookup_status": track.lookup_status,
+        "suggested_metadata": metadata_dict(track.suggested_metadata) if track.suggested_metadata else None,
         "file_name": track.path.name,
     }
 
@@ -296,21 +323,36 @@ def fallback_metadata(source: dict[str, Any], collection_title: str = "") -> Met
     )
 
 
-def json_http_error(exc: urllib.error.HTTPError) -> RuntimeError:
+def json_http_error(exc: urllib.error.HTTPError) -> MetadataHTTPError:
     body = exc.read().decode("utf-8", errors="replace")
     try:
         data = json.loads(body)
-        error = data.get("error") or {}
-        message = first_text(error.get("message"), data.get("message"), body)
     except json.JSONDecodeError:
-        message = body.strip() or exc.reason
-    return RuntimeError(f"HTTP {exc.code}: {message}")
+        data = body
+    if isinstance(data, dict):
+        error = data.get("error")
+        message = first_text(error.get("message") if isinstance(error, dict) else error, data.get("message"), body)
+    else:
+        message = first_text(data, body)
+    retry_after = 0.0
+    header = exc.headers.get("Retry-After", "") if exc.headers else ""
+    try:
+        retry_after = max(0.0, float(header))
+    except (TypeError, ValueError):
+        try:
+            retry_after = max(0.0, (parsedate_to_datetime(header) - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return MetadataHTTPError(exc.code, message or str(exc.reason), retry_after)
 
 
 def fetch_request_json(request: urllib.request.Request) -> dict[str, Any]:
     try:
         with urllib.request.urlopen(request, timeout=METADATA_LOOKUP_TIMEOUT_SECONDS) as response:
-            return json.loads(response.read().decode("utf-8"))
+            data = json.loads(response.read().decode("utf-8"))
+            if not isinstance(data, dict):
+                raise RuntimeError("The metadata service returned an unexpected response.")
+            return data
     except urllib.error.HTTPError as exc:
         raise json_http_error(exc) from exc
 
@@ -399,18 +441,24 @@ def acoustid_lookup(duration: int, fingerprint: str, fallback: Metadata) -> tupl
         },
     )
     if data.get("status") == "error":
-        error = data.get("error") or {}
-        raise RuntimeError(first_text(error.get("message"), "AcoustID rejected the lookup."))
+        error = data.get("error")
+        raise RuntimeError(first_text(error.get("message") if isinstance(error, dict) else error, "AcoustID rejected the lookup."))
     results = data.get("results") or []
+    if not isinstance(results, list):
+        raise RuntimeError("AcoustID returned an unexpected results format.")
     best_acoustid_score = 0.0
     best_rank = 0.0
     best_recording_id = ""
     for result in results:
+        if not isinstance(result, dict):
+            continue
         try:
             score = float(result.get("score") or 0)
         except (TypeError, ValueError):
             score = 0.0
         for recording in result.get("recordings") or []:
+            if not isinstance(recording, dict):
+                continue
             recording_id = first_text(recording.get("id"))
             rank = candidate_rank(score, recording, fallback)
             if recording_id and rank > best_rank:
@@ -422,16 +470,45 @@ def acoustid_lookup(duration: int, fingerprint: str, fallback: Metadata) -> tupl
     return best_acoustid_score, best_recording_id
 
 
-def musicbrainz_json(path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
-    global last_musicbrainz_request_at
+def wait_for_lookup(job: Job | None, seconds: float) -> bool:
+    end = time.monotonic() + max(0, seconds)
+    while time.monotonic() < end:
+        if job and (job.lookup_cancel.is_set() or time.monotonic() >= job.lookup_deadline):
+            return False
+        time.sleep(min(0.2, end - time.monotonic()))
+    return not job or not job.lookup_cancel.is_set() and time.monotonic() < job.lookup_deadline
+
+
+def musicbrainz_json(path: str, params: dict[str, str] | None = None, job: Job | None = None) -> dict[str, Any]:
+    global last_musicbrainz_request_at, musicbrainz_consecutive_503, musicbrainz_cooldown_until
     params = {**(params or {}), "fmt": "json"}
     url = f"https://musicbrainz.org/ws/2/{path}?{urllib.parse.urlencode(params)}"
     with musicbrainz_lock:
-        wait_seconds = 1.05 - (time.monotonic() - last_musicbrainz_request_at)
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
-        data = fetch_json(url, user_agent=MUSICBRAINZ_USER_AGENT)
+        if url in musicbrainz_cache:
+            return musicbrainz_cache[url]
+        wait_seconds = max(
+            MUSICBRAINZ_INTERVAL_SECONDS - (time.monotonic() - last_musicbrainz_request_at),
+            musicbrainz_cooldown_until - time.monotonic(),
+        )
+        if not wait_for_lookup(job, wait_seconds):
+            raise RuntimeError("Metadata lookup was cancelled or timed out.")
         last_musicbrainz_request_at = time.monotonic()
+        try:
+            data = fetch_json(url, user_agent=MUSICBRAINZ_USER_AGENT)
+        except MetadataHTTPError as exc:
+            if exc.status == 503:
+                musicbrainz_consecutive_503 += 1
+                if musicbrainz_consecutive_503 >= 3:
+                    cooldown = min(120, 30 * 2 ** (musicbrainz_consecutive_503 - 3))
+                    musicbrainz_cooldown_until = max(musicbrainz_cooldown_until, time.monotonic() + cooldown)
+            if exc.retry_after:
+                musicbrainz_cooldown_until = max(musicbrainz_cooldown_until, time.monotonic() + exc.retry_after)
+            raise
+        musicbrainz_consecutive_503 = 0
+        musicbrainz_cooldown_until = 0.0
+        if len(musicbrainz_cache) >= 2048:
+            musicbrainz_cache.clear()
+        musicbrainz_cache[url] = data
     return data
 
 
@@ -440,14 +517,14 @@ def artist_credit_name(entity: dict[str, Any]) -> str:
     for credit in entity.get("artist-credit") or []:
         if isinstance(credit, dict):
             artist = credit.get("artist") or {}
-            name = first_text(credit.get("name"), artist.get("name"))
+            name = first_text(credit.get("name"), artist.get("name") if isinstance(artist, dict) else "")
             if name:
                 names.append(name)
     return ", ".join(names)
 
 
 def first_release(recording: dict[str, Any]) -> dict[str, Any]:
-    releases = recording.get("releases") or []
+    releases = [release for release in recording.get("releases") or [] if isinstance(release, dict)]
     if not releases:
         return {}
     official = [release for release in releases if release.get("status") == "Official"]
@@ -460,18 +537,23 @@ def first_release(recording: dict[str, Any]) -> dict[str, Any]:
 
 def release_track_numbers(release: dict[str, Any], recording_id: str) -> tuple[str, str]:
     for medium in release.get("media") or []:
+        if not isinstance(medium, dict):
+            continue
         disc_number = str(medium.get("position") or "")
         for track in medium.get("tracks") or []:
+            if not isinstance(track, dict):
+                continue
             recording = track.get("recording") or {}
-            if recording.get("id") == recording_id:
+            if isinstance(recording, dict) and recording.get("id") == recording_id:
                 return str(track.get("number") or track.get("position") or ""), disc_number
     return "", ""
 
 
-def musicbrainz_metadata(recording_id: str, fallback: Metadata) -> Metadata:
+def musicbrainz_metadata(recording_id: str, fallback: Metadata, job: Job | None = None) -> Metadata:
     recording = musicbrainz_json(
         f"recording/{recording_id}",
         {"inc": "artists+releases+release-groups+media+isrcs"},
+        job,
     )
     release = first_release(recording)
     release_group = release.get("release-group") or {}
@@ -512,6 +594,79 @@ def identify_track(path: Path, fallback: Metadata) -> tuple[Metadata, float, str
         if "invalid api key" in message.casefold():
             message = "Invalid AcoustID API key. Use the Application API Key, not a user key."
         return fallback, 0, "fallback", message
+
+
+def lookup_job_metadata(job: Job) -> None:
+    pending = list(job.tracks)
+    try:
+        while pending and not job.lookup_cancel.is_set() and time.monotonic() < job.lookup_deadline:
+            retry = []
+            for track in pending:
+                if job.lookup_cancel.is_set() or time.monotonic() >= job.lookup_deadline:
+                    break
+                with job.state_lock:
+                    if job.status != "review" or track.lookup_status in {"accepted", "rejected"}:
+                        continue
+                    track.lookup_status = "searching"
+                try:
+                    if not ACOUSTID_API_KEY:
+                        raise RuntimeError("No AcoustID API key is configured.")
+                    if not track.recording_id:
+                        duration, fingerprint = fpcalc(track.path)
+                        score, recording_id = acoustid_lookup(duration, fingerprint, track.metadata)
+                        if score < ACOUSTID_MIN_SCORE:
+                            with job.state_lock:
+                                if track.lookup_status not in {"accepted", "rejected"} and not job.lookup_cancel.is_set():
+                                    track.confidence = score
+                                    track.lookup_status = "no_match"
+                                    track.message = "The AcoustID match was too uncertain."
+                            continue
+                        with job.state_lock:
+                            if track.lookup_status in {"accepted", "rejected"} or job.lookup_cancel.is_set():
+                                continue
+                            track.confidence = score
+                            track.recording_id = recording_id
+                    suggestion = musicbrainz_metadata(track.recording_id, track.metadata, job)
+                    with job.state_lock:
+                        if job.status == "review" and not job.lookup_cancel.is_set() and time.monotonic() < job.lookup_deadline and track.lookup_status not in {"rejected", "accepted"}:
+                            track.suggested_metadata = suggestion
+                            track.lookup_status = "suggested"
+                            track.message = "MusicBrainz match found."
+                except MetadataHTTPError as exc:
+                    with job.state_lock:
+                        if job.lookup_cancel.is_set() or track.lookup_status in {"accepted", "rejected"}:
+                            continue
+                        if exc.status in {429, 502, 503, 504}:
+                            track.lookup_status = "retrying"
+                            track.message = f"MusicBrainz is temporarily unavailable ({exc.status}); retrying after this pass."
+                            retry.append(track)
+                        elif exc.status == 404:
+                            track.lookup_status = "no_match"
+                            track.message = "MusicBrainz has no recording for this match."
+                        else:
+                            track.lookup_status = "unavailable"
+                            track.message = str(exc)
+                except FileNotFoundError:
+                    with job.state_lock:
+                        if track.lookup_status not in {"accepted", "rejected"}:
+                            track.lookup_status = "unavailable"
+                            track.message = "fpcalc is not installed."
+                except Exception as exc:
+                    with job.state_lock:
+                        if not job.lookup_cancel.is_set() and track.lookup_status not in {"accepted", "rejected"}:
+                            message = str(exc)
+                            track.lookup_status = "no_match" if "no matching musicbrainz recording" in message.casefold() else "unavailable"
+                            track.message = "Invalid AcoustID API key. Use the Application API Key, not a user key." if "invalid api key" in message.casefold() else message
+            pending = retry
+        with job.state_lock:
+            if not job.lookup_cancel.is_set():
+                for track in job.tracks:
+                    if track.lookup_status in {"pending", "searching", "retrying"}:
+                        track.lookup_status = "unavailable"
+                        track.message = "The ten-minute metadata lookup limit was reached."
+    finally:
+        with job.state_lock:
+            job.lookup_finished = True
 
 
 def progress_hook(job: Job):
@@ -893,18 +1048,11 @@ def run_job(job: Job) -> None:
         if job.playlist_items:
             files = deduplicate_playlist_filenames(files)
 
-        job.tracks = build_tracks(job, info, files, file_positions)
-        total_tracks = len(job.tracks)
-        for index, track in enumerate(job.tracks, start=1):
-            progress = 68 + ((index - 1) / max(total_tracks, 1)) * 20
-            touch(job, progress=progress, message=f"Checking metadata {index}/{total_tracks}")
-            metadata, confidence, status, message = identify_track(track.path, track.metadata)
-            track.metadata = metadata
-            track.confidence = confidence
-            track.status = status
-            track.message = message
-
-        touch(job, status="review", progress=91, message="Review metadata")
+        with job.state_lock:
+            job.tracks = build_tracks(job, info, files, file_positions)
+            job.lookup_deadline = time.monotonic() + METADATA_JOB_TIMEOUT_SECONDS
+            touch(job, status="review", progress=91, message="Review metadata; MusicBrainz lookup is running")
+        threading.Thread(target=lookup_job_metadata, args=(job,), daemon=True).start()
     except Exception as exc:
         job.error = str(exc)
         touch(job, status="failed", progress=0, message="Failed")
@@ -953,6 +1101,7 @@ async def cleanup_loop() -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=JOB_TTL_MINUTES)
         for job_id, job in list(jobs.items()):
             if job.updated_at < cutoff and job.status in {"done", "failed", "review"}:
+                job.lookup_cancel.set()
                 shutil.rmtree(JOBS_DIR / job_id, ignore_errors=True)
                 jobs.pop(job_id, None)
 
@@ -1011,20 +1160,48 @@ async def get_job(job_id: str) -> dict[str, Any]:
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found or already deleted.")
-    return {
-        "job_id": job.id,
-        "status": job.status,
-        "progress": round(job.progress, 1),
-        "message": job.message,
-        "error": job.error,
-        "download_ready": job.status == "done" and job.output_path is not None,
-        "download_name": job.download_name,
-        "download_size_bytes": job.output_path.stat().st_size if job.output_path and job.output_path.exists() else None,
-        "unpacked_size_bytes": unpacked_zip_size(job.output_path) if job.output_path and job.output_path.exists() else None,
-        "tracks": [track_response(track) for track in job.tracks],
-        "created_at": job.created_at.isoformat(),
-        "expires_after_minutes": JOB_TTL_MINUTES,
-    }
+    with job.state_lock:
+        return {
+            "job_id": job.id,
+            "status": job.status,
+            "progress": round(job.progress, 1),
+            "message": job.message,
+            "error": job.error,
+            "download_ready": job.status == "done" and job.output_path is not None,
+            "download_name": job.download_name,
+            "download_size_bytes": job.output_path.stat().st_size if job.output_path and job.output_path.exists() else None,
+            "unpacked_size_bytes": unpacked_zip_size(job.output_path) if job.output_path and job.output_path.exists() else None,
+            "tracks": [track_response(track) for track in job.tracks],
+            "lookup_active": job.status == "review" and not job.lookup_finished and not job.lookup_cancel.is_set(),
+            "created_at": job.created_at.isoformat(),
+            "expires_after_minutes": JOB_TTL_MINUTES,
+        }
+
+
+@app.post("/api/jobs/{job_id}/matches")
+async def decide_match(job_id: str, request: MatchDecision) -> dict[str, Any]:
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or already deleted.")
+    with job.state_lock:
+        if job.status != "review":
+            raise HTTPException(status_code=409, detail="Job is not ready for metadata review.")
+        targets = job.tracks if request.action == "accept_all" else [track for track in job.tracks if track.id == request.track_id]
+        if not targets:
+            raise HTTPException(status_code=404, detail="Track not found.")
+        for track in targets:
+            if request.action in {"accept", "accept_all"} and track.lookup_status == "suggested" and track.suggested_metadata:
+                track.metadata = track.suggested_metadata.model_copy(deep=True)
+                track.lookup_status = "accepted"
+                track.status = "matched"
+                track.message = "MusicBrainz suggestion accepted."
+            elif request.action == "reject" and track.lookup_status not in {"accepted", "rejected"}:
+                track.lookup_status = "rejected"
+                track.suggested_metadata = None
+                track.message = "MusicBrainz suggestion rejected; fallback metadata retained."
+            elif request.action != "accept_all":
+                raise HTTPException(status_code=409, detail="No pending suggestion is available for this track.")
+        return {"tracks": [track_response(track) for track in job.tracks], "lookup_active": not job.lookup_finished and not job.lookup_cancel.is_set()}
 
 
 @app.post("/api/jobs/{job_id}/finalize")
@@ -1032,15 +1209,15 @@ async def finalize(job_id: str, request: FinalizeRequest) -> dict[str, str]:
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found or already deleted.")
-    if job.status != "review":
-        raise HTTPException(status_code=409, detail="Job is not ready for metadata review.")
-
-    submitted = {track.id: track.metadata for track in request.tracks}
-    for track in job.tracks:
-        if track.id in submitted:
-            track.metadata = submitted[track.id]
-
-    touch(job, status="finalizing", progress=92, message="Finalizing download")
+    with job.state_lock:
+        if job.status != "review":
+            raise HTTPException(status_code=409, detail="Job is not ready for metadata review.")
+        job.lookup_cancel.set()
+        submitted = {track.id: track.metadata for track in request.tracks}
+        for track in job.tracks:
+            if track.id in submitted:
+                track.metadata = submitted[track.id]
+        touch(job, status="finalizing", progress=92, message="Finalizing download")
     asyncio.create_task(asyncio.to_thread(finalize_job, job))
     return {"job_id": job.id}
 

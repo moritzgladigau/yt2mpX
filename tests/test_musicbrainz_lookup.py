@@ -1,0 +1,146 @@
+import asyncio
+import io
+import time
+import unittest
+import urllib.error
+from pathlib import Path
+from unittest.mock import patch
+
+from fastapi import HTTPException
+
+from app import main
+
+
+def track(number):
+    return main.Track(str(number), Path(f"{number}.mp3"), number, f"Track {number}", "Artist", "", main.Metadata(title=f"Track {number}"))
+
+
+def job_with_tracks(count=2):
+    job = main.Job("lookup-test", "url", "mp3", "session", status="review", tracks=[track(i) for i in range(count)])
+    job.lookup_deadline = time.monotonic() + 600
+    return job
+
+
+class MusicBrainzLookupTests(unittest.TestCase):
+    def setUp(self):
+        main.musicbrainz_cache.clear()
+        main.last_musicbrainz_request_at = 0
+        main.musicbrainz_consecutive_503 = 0
+        main.musicbrainz_cooldown_until = 0
+
+    def test_text_error_preserves_status_and_retry_after(self):
+        error = urllib.error.HTTPError("url", 503, "busy", {"Retry-After": "7"}, io.BytesIO(b'{"error":"Server busy"}'))
+        parsed = main.json_http_error(error)
+        error.close()
+        self.assertEqual(parsed.status, 503)
+        self.assertEqual(parsed.retry_after, 7)
+        self.assertIn("Server busy", str(parsed))
+
+    def test_playlist_first_pass_continues_after_503(self):
+        job = job_with_tracks(3)
+        calls = []
+
+        def lookup(recording_id, fallback, _job):
+            calls.append(recording_id)
+            if recording_id == "rec-0" and calls.count("rec-0") == 1:
+                raise main.MetadataHTTPError(503, "busy")
+            return main.Metadata(title=f"Found {recording_id}")
+
+        with patch.object(main, "ACOUSTID_API_KEY", "key"), patch.object(main, "fpcalc", return_value=(100, "fingerprint")), patch.object(main, "acoustid_lookup", side_effect=lambda _d, _f, fallback: (0.99, f"rec-{fallback.title[-1]}")), patch.object(main, "musicbrainz_metadata", side_effect=lookup):
+            main.lookup_job_metadata(job)
+        self.assertEqual(calls, ["rec-0", "rec-1", "rec-2", "rec-0"])
+        self.assertTrue(all(item.lookup_status == "suggested" for item in job.tracks))
+        self.assertEqual(job.tracks[0].metadata.title, "Track 0")
+        self.assertEqual(job.tracks[0].suggested_metadata.title, "Found rec-0")
+
+    def test_global_rate_cache_and_overload_pause(self):
+        calls = []
+        with patch.object(main, "MUSICBRAINZ_INTERVAL_SECONDS", 0.0), patch.object(main, "fetch_json", side_effect=lambda url, **_kwargs: calls.append(url) or {"title": "Found"}):
+            main.musicbrainz_json("recording/same")
+            main.musicbrainz_json("recording/same")
+        self.assertEqual(len(calls), 1)
+
+        main.musicbrainz_cache.clear()
+        main.last_musicbrainz_request_at = time.monotonic()
+        with patch.object(main, "fetch_json", return_value={"title": "Found"}), patch.object(main, "wait_for_lookup", return_value=True) as wait:
+            main.musicbrainz_json("recording/another")
+        self.assertGreater(wait.call_args.args[1], 1.0)
+
+        main.musicbrainz_cache.clear()
+        with patch.object(main, "MUSICBRAINZ_INTERVAL_SECONDS", 0.0), patch.object(main, "fetch_json", side_effect=main.MetadataHTTPError(503, "busy")), patch.object(main, "wait_for_lookup", return_value=True) as wait:
+            for i in range(3):
+                with self.assertRaises(main.MetadataHTTPError):
+                    main.musicbrainz_json(f"recording/{i}")
+        self.assertGreaterEqual(main.musicbrainz_cooldown_until - time.monotonic(), 29)
+        self.assertEqual(wait.call_count, 3)
+
+    def test_repeated_503_and_duplicate_ids(self):
+        job = job_with_tracks(3)
+        calls = []
+
+        def lookup(recording_id, fallback, _job):
+            calls.append(recording_id)
+            if recording_id == "same" and calls.count("same") <= 2:
+                raise main.MetadataHTTPError(503, "busy")
+            return main.Metadata(title="Found")
+
+        with patch.object(main, "ACOUSTID_API_KEY", "key"), patch.object(main, "fpcalc", return_value=(100, "fingerprint")), patch.object(main, "acoustid_lookup", side_effect=[(0.99, "same"), (0.99, "other"), (0.99, "same")]), patch.object(main, "musicbrainz_metadata", side_effect=lookup):
+            main.lookup_job_metadata(job)
+        self.assertEqual(calls[:3], ["same", "other", "same"])
+        self.assertTrue(all(item.lookup_status == "suggested" for item in job.tracks))
+
+    def test_reject_while_response_is_in_flight(self):
+        job = job_with_tracks(1)
+        main.jobs[job.id] = job
+        self.addCleanup(main.jobs.pop, job.id, None)
+
+        def lookup(_recording_id, _fallback, _job):
+            asyncio.run(main.decide_match(job.id, main.MatchDecision(action="reject", track_id="0")))
+            return main.Metadata(title="Late match")
+
+        with patch.object(main, "ACOUSTID_API_KEY", "key"), patch.object(main, "fpcalc", return_value=(100, "fingerprint")), patch.object(main, "acoustid_lookup", return_value=(0.99, "same")), patch.object(main, "musicbrainz_metadata", side_effect=lookup):
+            main.lookup_job_metadata(job)
+        self.assertEqual(job.tracks[0].lookup_status, "rejected")
+        self.assertIsNone(job.tracks[0].suggested_metadata)
+
+    def test_deadline_and_decisions(self):
+        job = job_with_tracks()
+        job.lookup_deadline = time.monotonic() - 1
+        main.lookup_job_metadata(job)
+        self.assertTrue(job.lookup_finished)
+        self.assertTrue(all(item.lookup_status == "unavailable" for item in job.tracks))
+
+        job.lookup_deadline = time.monotonic() + 600
+        for item in job.tracks:
+            item.suggested_metadata = main.Metadata(title=f"Found {item.id}")
+            item.lookup_status = "suggested"
+        main.jobs[job.id] = job
+        self.addCleanup(main.jobs.pop, job.id, None)
+        asyncio.run(main.decide_match(job.id, main.MatchDecision(action="reject", track_id="0")))
+        asyncio.run(main.decide_match(job.id, main.MatchDecision(action="accept_all")))
+        self.assertEqual(job.tracks[0].metadata.title, "Track 0")
+        self.assertEqual(job.tracks[0].lookup_status, "rejected")
+        self.assertEqual(job.tracks[1].metadata.title, "Found 1")
+        with self.assertRaises(HTTPException):
+            asyncio.run(main.decide_match(job.id, main.MatchDecision(action="accept", track_id="0")))
+
+    def test_accept_one_leaves_other_suggestion_pending(self):
+        job = job_with_tracks()
+        for item in job.tracks:
+            item.suggested_metadata = main.Metadata(title=f"Found {item.id}")
+            item.lookup_status = "suggested"
+        main.jobs[job.id] = job
+        self.addCleanup(main.jobs.pop, job.id, None)
+        result = asyncio.run(main.decide_match(job.id, main.MatchDecision(action="accept", track_id="0")))
+        self.assertEqual(result["tracks"][0]["metadata"]["title"], "Found 0")
+        self.assertEqual(result["tracks"][1]["metadata"]["title"], "Track 1")
+        self.assertEqual(result["tracks"][1]["lookup_status"], "suggested")
+
+    def test_finalize_cancels_late_lookup(self):
+        job = job_with_tracks(1)
+        main.jobs[job.id] = job
+        self.addCleanup(main.jobs.pop, job.id, None)
+        with patch.object(main, "finalize_job"):
+            asyncio.run(main.finalize(job.id, main.FinalizeRequest(tracks=[])))
+        self.assertTrue(job.lookup_cancel.is_set())
+        self.assertEqual(job.status, "finalizing")

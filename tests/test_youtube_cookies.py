@@ -56,7 +56,7 @@ class YoutubeCookieTests(unittest.TestCase):
     def test_anonymous_probe_and_job_do_not_use_cookiefile(self):
         main.run_probe("https://www.youtube.com/watch?v=example")
         job = main.Job("anonymous", "https://www.youtube.com/watch?v=example", "mp3", "browser")
-        with patch.object(main, "JOBS_DIR", self.root), patch.object(main, "identify_track", side_effect=lambda _, metadata: (metadata, 0, "fallback", "")):
+        with patch.object(main, "JOBS_DIR", self.root), patch.object(main, "lookup_job_metadata"):
             main.run_job(job)
         self.assertEqual(job.status, "review")
         self.assertEqual(len(FakeYoutubeDL.calls), 2)
@@ -65,7 +65,7 @@ class YoutubeCookieTests(unittest.TestCase):
     def test_account_probe_and_job_use_private_temporary_copies(self):
         main.run_probe("https://www.youtube.com/watch?v=example", True)
         job = main.Job("account", "https://www.youtube.com/watch?v=example", "mp3", "browser", use_youtube_cookies=True)
-        with patch.object(main, "JOBS_DIR", self.root), patch.object(main, "identify_track", side_effect=lambda _, metadata: (metadata, 0, "fallback", "")):
+        with patch.object(main, "JOBS_DIR", self.root), patch.object(main, "lookup_job_metadata"):
             main.run_job(job)
         self.assertEqual(job.status, "review")
         paths = [Path(call.options["cookiefile"]) for call in FakeYoutubeDL.calls]

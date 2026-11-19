@@ -716,6 +716,16 @@ progress {
 .review-actions {
   display: flex;
   justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.review-suggestion {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 13px;
 }
 
 .temp-history {
